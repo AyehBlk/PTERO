@@ -12,7 +12,7 @@ A Python package (early development).
 Clone the repository:
 
 ```bash
-git clone <REPO_URL>
+git clone https://github.com/AyehBlk/PTERO
 cd PTERO
 ```
 
