@@ -29,7 +29,7 @@ source .venv/bin/activate
 Install in development (editable) mode:
 
 ```bash
-pip install -e .
+pip install -e ".[raw,dashboard,dev]
 ```
 
 ## Verify the install
