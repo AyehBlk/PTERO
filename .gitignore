@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+.venv_test/
+
+# MS data & generated stores — never commit these
+*.zarr/
+*.d/
+*.raw
+*.mzML
+*.mzXML
+combined/
+
+# OS / editor
+.DS_Store
+.vscode/
+# Personal scratch / scripts not part of the package
+/crosscheck_alphatims.py
+/inspect_dia.py
+/run_checks.py
+/try_hela.py
+
+# Private status/strategy docs — not for the shared repo
+/docs/

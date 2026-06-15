@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ptero"
+version = "0.1.0"
+description = "Proteomics Tool for Exploratory Research & Optimization"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "pandas>=2.0", "scipy>=1.10"]
+
+[project.optional-dependencies]
+viz = ["plotly>=5.18", "bokeh>=3.3"]
+dashboard = ["ptero[viz]", "panel>=1.4", "holoviews>=1.18", "datashader>=0.16", "colorcet>=3.0", "param>=2.0"]
+stats = ["scikit-learn>=1.3", "statsmodels>=0.14"]
+bigdata = ["ptero[dashboard]", "dask[dataframe]>=2024.1"]
+zarr = ["zarr>=2.16", "pyarrow>=12.0"]
+raw = ["zarr>=3.0", "pyarrow>=12.0", "pyteomics>=4.6", "psims>=1.3", "polars>=1.0"]
+# Bruker timsTOF .d reading (Windows/Linux only; m/z & mobility need Bruker libs):
+bruker = ["alphatims"]
+full = ["ptero[dashboard,stats,zarr,bigdata,raw]"]
+dev = ["pytest>=7.0", "ruff"]
+
+[tool.setuptools.packages.find]
+include = ["ptero*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

@@ -1,0 +1,289 @@
+"""
+Zarr backend for raw MS data (3D and 4D) -- the chunked, cloud-native store.
+
+This is the piece that does not exist in the Python MS ecosystem yet: a lazy,
+chunked on-disk backend for raw spectra that conforms to a common Spectra-style
+interface, so a 50 GB timsTOF run never has to fit in RAM.
+
+On-disk layout (a ``.zarr`` directory / store)
+-----------------------------------------------
+::
+
+    experiment.zarr/
+      .zattrs                 global metadata (n_spectra, has_4d, peaks_variables)
+      peaks/
+        mz          (1D chunked float64)   flat m/z for ALL spectra concatenated
+        intensity   (1D chunked float32)
+        ion_mobility(1D chunked float32)   only if 4D
+      offsets       (1D int64, length n+1) CSR index-pointer into the flat arrays
+      spectra.parquet                      spectrum-level metadata (columnar)
+
+Peaks are stored as flat chunked arrays + a CSR ``offsets`` array (NOT one file
+per spectrum -- that would create millions of tiny objects and is pathological
+on real / cloud filesystems). Reading spectrum ``i`` slices
+``mz[offsets[i]:offsets[i+1]]``, and Zarr only fetches the chunks that overlap
+that slice. Metadata goes to Parquet because it is tabular and benefits from
+columnar compression and projection.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Optional, Sequence
+
+import numpy as np
+import pandas as pd
+
+from ._base import MsBackend, DEFAULT_PEAKS_VARIABLES
+
+
+def _require_zarr():
+    try:
+        import zarr  # noqa
+    except Exception as e:  # pragma: no cover
+        raise ImportError("MsBackendZarr requires `zarr`. Install with pip install ptero[zarr].") from e
+
+
+class MsBackendZarr(MsBackend):
+    """Lazy, chunked Zarr-backed store for raw spectra."""
+
+    read_only = False  # peaks are immutable once written; metadata editable in memory
+
+    def __init__(self, path: str, _idx: Optional[np.ndarray] = None):
+        _require_zarr()
+        import zarr
+
+        self.path = str(path)
+        self._root = zarr.open_group(self.path, mode="r")
+        attrs = dict(self._root.attrs)
+        self.has_4d = bool(attrs.get("has_4d", False))
+        #: "dda" | "dia" | "unknown" -- the acquisition mode recorded at write time
+        self.acquisition_mode = str(attrs.get("acquisition_mode", "unknown"))
+        self._n_total = int(attrs.get("n_spectra", 0))
+        self._offsets = self._root["offsets"][:]  # small (n+1,), cheap to hold
+        # view index (subsetting without rewriting the store)
+        self._idx = np.arange(self._n_total, dtype=np.int64) if _idx is None else np.asarray(_idx, np.int64)
+        # metadata lives in a Parquet sidecar
+        self._meta_path = Path(self.path) / "spectra.parquet"
+
+    # ── writing ──────────────────────────────────────────────────────────
+    @classmethod
+    def write(cls, path, meta: pd.DataFrame, mz, intensity, offsets,
+              ion_mobility=None, chunk_size: int = 1_000_000,
+              compressor="zstd", acquisition_mode: str = "unknown") -> "MsBackendZarr":
+        """Create a Zarr store from CSR peak arrays + metadata, return the backend."""
+        _require_zarr()
+        import zarr
+
+        path = str(path)
+        mz = np.asarray(mz, np.float64)
+        intensity = np.asarray(intensity, np.float32)
+        offsets = np.asarray(offsets, np.int64)
+        has_4d = ion_mobility is not None
+
+        root = zarr.open_group(path, mode="w")
+        root.attrs["n_spectra"] = int(len(offsets) - 1)
+        root.attrs["has_4d"] = bool(has_4d)
+        root.attrs["acquisition_mode"] = str(acquisition_mode)
+        root.attrs["peaks_variables"] = list(
+            ("mz", "intensity", "ion_mobility") if has_4d else ("mz", "intensity")
+        )
+        peaks = root.create_group("peaks")
+
+        def _write_array(group, name, data):
+            n = max(1, len(data))
+            arr = group.create_array(
+                name, shape=(len(data),), chunks=(min(chunk_size, n),), dtype=data.dtype
+            )
+            if len(data):
+                arr[:] = data
+
+        _write_array(peaks, "mz", mz)
+        _write_array(peaks, "intensity", intensity)
+        if has_4d:
+            _write_array(peaks, "ion_mobility", np.asarray(ion_mobility, np.float32))
+        off_arr = root.create_array("offsets", shape=(len(offsets),),
+                                    chunks=(len(offsets),), dtype="i8")
+        off_arr[:] = offsets
+
+        # metadata -> parquet sidecar
+        meta = meta.reset_index(drop=True).copy()
+        if "data_storage" not in meta.columns:
+            meta["data_storage"] = path
+        meta.to_parquet(Path(path) / "spectra.parquet", index=False)
+        return cls(path)
+
+    # ── required interface ───────────────────────────────────────────────
+    def __len__(self) -> int:
+        return len(self._idx)
+
+    def spectra_data(self, columns=None) -> pd.DataFrame:
+        cols = None if columns is None else list(columns)
+        # Parquet projection: read only requested columns when possible
+        df = pd.read_parquet(self._meta_path, columns=cols) if cols else pd.read_parquet(self._meta_path)
+        df = df.iloc[self._idx].reset_index(drop=True)
+        return self._ensure_core_columns(df) if columns is None else df
+
+    def peaks_data(self, indices=None, columns=DEFAULT_PEAKS_VARIABLES):
+        view = self._normalize_indices(indices, len(self))
+        backend_idx = self._idx[view]  # map view positions -> storage rows
+        cols = list(columns)
+        mz_a = self._root["peaks"]["mz"]
+        int_a = self._root["peaks"]["intensity"]
+        im_a = self._root["peaks"]["ion_mobility"] if self.has_4d and "ion_mobility" in cols else None
+        out = []
+        for bi in backend_idx:
+            s, e = int(self._offsets[bi]), int(self._offsets[bi + 1])
+            arrs = []
+            for c in cols:
+                if c == "mz":
+                    arrs.append(mz_a[s:e].astype(np.float64))
+                elif c == "intensity":
+                    arrs.append(int_a[s:e].astype(np.float64))
+                elif c == "ion_mobility":
+                    if not self.has_4d:
+                        raise KeyError("ion_mobility not available (3D data)")
+                    arrs.append(im_a[s:e].astype(np.float64))
+                else:
+                    raise KeyError(f"unknown peaks variable {c!r}")
+            out.append(np.column_stack(arrs) if arrs else np.empty((0, 0)))
+        return out
+
+    def subset(self, indices: Sequence[int]) -> "MsBackendZarr":
+        idx = self._idx[np.asarray(indices, dtype=np.int64)]
+        return MsBackendZarr(self.path, _idx=idx)
+
+    def iter_peaks_blocked(self, indices=None, columns=DEFAULT_PEAKS_VARIABLES,
+                           block_size: int = 4_000_000):
+        """Yield ``(view_position, peaks)`` for the requested spectra, reading the
+        flat ``peaks/*`` arrays in large **contiguous blocks** rather than one slice
+        per spectrum.
+
+        Reading spectrum-by-spectrum re-fetches and re-decompresses the same Zarr
+        chunk once per spectrum that overlaps it -- on a run with tens of thousands
+        of spectra that is the dominant cost. Here we walk the requested spectra in
+        storage order, read up to ``block_size`` peaks at a time in a single slice
+        (so each chunk is decompressed once), and slice each spectrum out of the
+        in-memory block. Memory is bounded to one block; results are yielded in
+        storage order with their original view position so callers can place them.
+        """
+        view = self._normalize_indices(indices, len(self))
+        rows = self._idx[view]                       # storage rows
+        n = len(rows)
+        if n == 0:
+            return
+        cols = list(columns)
+        mz_a = self._root["peaks"]["mz"]
+        int_a = self._root["peaks"]["intensity"]
+        im_a = self._root["peaks"]["ion_mobility"] if (self.has_4d and "ion_mobility" in cols) else None
+        offs = self._offsets
+        order = np.argsort(rows, kind="stable")      # storage order -> contiguous reads
+        sr = rows[order]
+        i = 0
+        while i < n:
+            bstart = int(offs[sr[i]])
+            j = i
+            # extend the block while it stays within the peak budget
+            while j + 1 < n and (int(offs[sr[j + 1] + 1]) - bstart) <= block_size:
+                j += 1
+            bend = int(offs[sr[j] + 1])
+            mzb = mz_a[bstart:bend]
+            intb = int_a[bstart:bend]
+            imb = im_a[bstart:bend] if im_a is not None else None
+            for k in range(i, j + 1):
+                r = sr[k]; s = int(offs[r]) - bstart; e = int(offs[r + 1]) - bstart
+                arrs = []
+                for c in cols:
+                    if c == "mz":
+                        arrs.append(mzb[s:e].astype(np.float64))
+                    elif c == "intensity":
+                        arrs.append(intb[s:e].astype(np.float64))
+                    elif c == "ion_mobility":
+                        if imb is None:
+                            raise KeyError("ion_mobility not available (3D data)")
+                        arrs.append(imb[s:e].astype(np.float64))
+                    else:
+                        raise KeyError(f"unknown peaks variable {c!r}")
+                P = np.column_stack(arrs) if arrs else np.empty((0, 0))
+                yield int(order[k]), P
+            i = j + 1
+
+
+class _ZarrStreamWriter:
+    """Write a Zarr store incrementally, one batch of spectra at a time.
+
+    This is the memory-safe path for large runs. Only the *current* batch's
+    peaks are ever in RAM; the flat ``peaks/*`` arrays are grown on disk with
+    ``resize`` + slice-assign, while the small ``offsets`` index and the
+    spectrum metadata accumulate and are written once in :meth:`finalize`.
+
+    Produces a store byte-for-byte compatible with :meth:`MsBackendZarr.write`,
+    so anything that opens a Zarr store reads a streamed one identically.
+
+    Usage::
+
+        w = _ZarrStreamWriter(path, has_4d=True)
+        for mem in batches:          # each `mem` is an MsBackendMemory
+            w.append_backend(mem)
+        backend = w.finalize()
+    """
+
+    def __init__(self, path, has_4d: bool, chunk_size: int = 1_000_000,
+                 acquisition_mode: str = "unknown"):
+        _require_zarr()
+        import zarr
+
+        self.path = str(path)
+        self.has_4d = bool(has_4d)
+        self.acquisition_mode = str(acquisition_mode)
+        self._root = zarr.open_group(self.path, mode="w")
+        peaks = self._root.create_group("peaks")
+        self._mz = peaks.create_array("mz", shape=(0,), chunks=(chunk_size,), dtype="f8")
+        self._int = peaks.create_array("intensity", shape=(0,), chunks=(chunk_size,), dtype="f4")
+        self._im = (peaks.create_array("ion_mobility", shape=(0,), chunks=(chunk_size,), dtype="f4")
+                    if self.has_4d else None)
+        self._offsets = [0]        # CSR index-pointer (small: one int per spectrum)
+        self._meta_parts = []      # list of metadata DataFrames (small)
+
+    @staticmethod
+    def _grow(arr, data):
+        """Append a 1D array to a resizable Zarr array via resize + slice-assign."""
+        old = arr.shape[0]
+        n = len(data)
+        if n:
+            arr.resize((old + n,))
+            arr[old:old + n] = data
+
+    def append_backend(self, mem) -> None:
+        """Append one in-memory batch (an ``MsBackendMemory``) to the store."""
+        n_new = int(mem._offsets[-1])          # total peaks in this batch
+        if n_new:
+            self._grow(self._mz, np.asarray(mem._mz, np.float64))
+            self._grow(self._int, np.asarray(mem._intensity, np.float32))
+            if self.has_4d:
+                im = mem._im if mem._im is not None else np.full(n_new, np.nan, np.float32)
+                self._grow(self._im, np.asarray(im, np.float32))
+        # extend the CSR offsets, shifting this batch's local ends by the running total
+        base = self._offsets[-1]
+        self._offsets.extend((base + np.asarray(mem._offsets[1:], np.int64)).tolist())
+        self._meta_parts.append(mem._meta.reset_index(drop=True))
+
+    def finalize(self) -> "MsBackendZarr":
+        """Write offsets, attributes, and the metadata sidecar; return the backend."""
+        offsets = np.asarray(self._offsets, np.int64)
+        off_arr = self._root.create_array("offsets", shape=(len(offsets),),
+                                          chunks=(len(offsets),), dtype="i8")
+        off_arr[:] = offsets
+        self._root.attrs["n_spectra"] = int(len(offsets) - 1)
+        self._root.attrs["has_4d"] = self.has_4d
+        self._root.attrs["acquisition_mode"] = self.acquisition_mode
+        self._root.attrs["peaks_variables"] = list(
+            ("mz", "intensity", "ion_mobility") if self.has_4d else ("mz", "intensity")
+        )
+        meta = (pd.concat(self._meta_parts, ignore_index=True)
+                if self._meta_parts else pd.DataFrame())
+        meta["scan_index"] = np.arange(len(meta), dtype=np.int64)   # global, unique across batches
+        if "data_storage" not in meta.columns:
+            meta["data_storage"] = self.path
+        meta.to_parquet(Path(self.path) / "spectra.parquet", index=False)
+        return MsBackendZarr(self.path)

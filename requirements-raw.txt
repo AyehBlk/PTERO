@@ -1,0 +1,9 @@
+# Minimal dependencies to run the PTERO raw-spectra layer + run_checks.py
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+zarr>=3.0
+pyarrow>=12.0
+pyteomics>=4.6
+psims>=1.3
+polars>=1.0
