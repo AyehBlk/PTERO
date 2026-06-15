@@ -84,11 +84,13 @@ def _timstof_to_spectra(df: pd.DataFrame):
             lvl = int(g["ms_level"].iloc[0])
         else:
             lvl = 1 if (not has_prec or pd.isna(prec)) else 2
+        mob = g["mobility"].to_numpy(dtype=np.float64)
         meta_rows.append({
             "ms_level": lvl,
             "rtime": float(g["rt"].iloc[0]),
             "scan_index": scan_index,
             "precursor_mz": float(prec) if (has_prec and not pd.isna(prec)) else np.nan,
+            "ion_mobility": float(np.median(mob)) if mob.size else np.nan,
         })
         peaks.append({
             "mz": g["mz"].to_numpy(dtype=np.float64),
