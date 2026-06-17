@@ -2,7 +2,7 @@
 
 ## Install (once)
 
-Needs Python << FILL IN: e.g. 3.10+ >> and Git.
+Needs Python and Git.
 
 ```powershell
 git clone https://github.com/AyehBlk/PTERO.git
