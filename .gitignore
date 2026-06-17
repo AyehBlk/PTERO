@@ -30,3 +30,10 @@ combined/
 
 # Private status/strategy docs — not for the shared repo
 /docs/
+scratch_*.py
+# append a rule to .gitignore
+Add-Content .gitignore "`nscratch_*.py"
+
+scratch_*.py
+
+scratch_*.py

@@ -634,18 +634,30 @@ class Dashboard:
 
     # ── DIA: acquisition-mode detection + window-scheme view ───────────────
     def _is_dia(self) -> bool:
-        """True if the loaded store is diaPASEF.
+        """True if the loaded store is DIA.
 
-        Prefers the ``acquisition_mode`` recorded in the store at conversion time;
-        falls back to the presence of DIA window columns (older stores or an
-        in-memory backend that carries no attribute)."""
+        Prefers the ``acquisition_mode`` recorded at conversion time. Falls back
+        to a structural heuristic, because the mere *presence* of isolation
+        columns does NOT imply DIA -- DDA also records an isolation window (a
+        narrow one) around each selected precursor. DIA is distinguished by a
+        SMALL number of repeating isolation windows reused across the run, while
+        DDA has very many distinct precursor m/z (≈ one per MS2 scan)."""
         if self.sp is None:
             return False
         mode = getattr(self.sp._backend, "acquisition_mode", "unknown")
         if mode in ("dia", "dda"):
             return mode == "dia"
+        # heuristic fallback for stores with no recorded mode
         try:
-            return "isolation_mz_lower" in self.sp.spectra_data().columns
+            md = self.sp.spectra_data(["ms_level", "isolation_mz"])
+            ms2 = md[md["ms_level"] == 2]
+            n_ms2 = len(ms2)
+            if n_ms2 == 0 or "isolation_mz" not in ms2.columns:
+                return False
+            n_distinct = ms2["isolation_mz"].round(1).nunique()
+            # DIA reuses a fixed window set: few distinct centres relative to scans.
+            # DDA targets a fresh precursor most scans: many distinct centres.
+            return n_distinct <= max(80, n_ms2 * 0.05)
         except Exception:
             return False
 
@@ -654,34 +666,50 @@ class Dashboard:
         the DDA 'Precursor' tab. The scheme is a property of the acquisition
         method, so it is shown whole-run, independent of the view sliders."""
         try:
-            cols = ["ms_level", "window_group", "window_id", "isolation_mz",
-                    "isolation_mz_lower", "isolation_mz_upper",
-                    "isolation_im_lower", "isolation_im_upper"]
+            wanted = ["ms_level", "window_group", "window_id", "isolation_mz",
+                      "isolation_mz_lower", "isolation_mz_upper",
+                      "isolation_im_lower", "isolation_im_upper"]
+            # request only columns the store actually has (3D / DDA stores lack the
+            # mobility-bound columns, and asking for a missing column errors)
+            available = set(self.sp.spectra_data().columns)
+            cols = [c for c in wanted if c in available]
             md = self.sp.spectra_data(cols)
-            md = md[md["ms_level"] == 2].drop_duplicates("window_id")
-            if len(md) == 0 or md["isolation_mz_lower"].isna().all():
-                return pn.pane.Markdown("_No diaPASEF window metadata in this store._")
-            ngroup = int(md["window_group"].nunique())
-            have_im = bool(md["isolation_im_lower"].notna().any())
+            if "ms_level" in md.columns:
+                md = md[md["ms_level"] == 2]
+            if "window_id" in md.columns:
+                md = md.drop_duplicates("window_id")
+            if (len(md) == 0 or "isolation_mz_lower" not in md.columns
+                    or md["isolation_mz_lower"].isna().all()):
+                return pn.pane.Markdown("_No DIA window-scheme metadata in this store._")
+            ngroup = int(md["window_group"].nunique()) if "window_group" in md.columns else 1
+            have_im = ("isolation_im_lower" in md.columns
+                       and bool(md["isolation_im_lower"].notna().any()))
 
             if have_im:
                 y0 = md["isolation_im_lower"].to_numpy(dtype="float64")
                 y1 = md["isolation_im_upper"].to_numpy(dtype="float64")
                 ylabel = "1/K0 (mobility)"
-            else:
+            elif "window_group" in md.columns:
                 # fallback when a store predates mobility bounds: stack by group so
                 # the m/z tiling is still visible
                 g = md["window_group"].to_numpy(dtype="float64")
                 y0, y1 = g - 0.4, g + 0.4
                 ylabel = "window group (no 1/K0 bounds stored)"
+            else:
+                y0 = np.zeros(len(md)); y1 = np.ones(len(md))
+                ylabel = "(no group / mobility bounds stored)"
 
             rect = pd.DataFrame({
                 "x0": md["isolation_mz_lower"].to_numpy("float64"),
                 "y0": y0,
                 "x1": md["isolation_mz_upper"].to_numpy("float64"),
                 "y1": y1,
-                "group": md["window_group"].astype(int).astype(str).to_numpy(),
-                "mz": md["isolation_mz"].to_numpy("float64"),
+                "group": (md["window_group"].astype(int).astype(str).to_numpy()
+                          if "window_group" in md.columns
+                          else np.array(["1"] * len(md))),
+                "mz": (md["isolation_mz"].to_numpy("float64")
+                       if "isolation_mz" in md.columns
+                       else np.full(len(md), np.nan)),
             })
             # colour by window group; hover carries the group + centre m/z. Legend is
             # left off deliberately (HoloViews Rectangles legends are unreliable) —
@@ -814,12 +842,15 @@ class Dashboard:
 
     # ── layout ─────────────────────────────────────────────────────────────
     def view(self):
+        from ._browse import browse_field
         source = pn.Column(
             pn.pane.Markdown("## 1 · Data source"),
-            pn.Row(self.zarr_path, pn.Column(pn.Spacer(height=18), self.open_btn)),
+            browse_field(self.zarr_path, patterns=["*.zarr"], width=560),
+            pn.Row(pn.Column(pn.Spacer(height=18), self.open_btn)),
             pn.pane.Markdown("— or convert a raw file —"),
-            pn.Row(self.raw_path, self.out_path, self.conv_ms,
-                   self.conv_frames, self.conv_batch,
+            browse_field(self.raw_path, patterns=["*.d", "*.mzML"], width=560),
+            pn.Row(browse_field(self.out_path, patterns=["*.zarr"], width=420),
+                   self.conv_ms, self.conv_frames, self.conv_batch,
                    pn.Column(pn.Spacer(height=18), self.conv_btn)),
             pn.pane.Markdown("— or convert many raw files in parallel "
                              "(each → its own .zarr; uses the MS level & frames/batch above) —"),
@@ -837,6 +868,34 @@ class Dashboard:
             sizing_mode="stretch_width")
 
 
-def build_app():
-    """Build and return the dashboard layout (call ``.servable()`` to serve)."""
+def build_raw_page():
+    """The raw-data / converter page (the original single-page dashboard)."""
     return Dashboard().view()
+
+
+def build_app():
+    """Build the multi-page PTERO dashboard and return a servable template.
+
+    Pages share one :class:`~ptero.dashboard._state.AppState` so inputs loaded on
+    one page are visible to others. The converter / raw-data dashboard is the
+    main page; the ID-annotation page is page 1. More pages slot in here later.
+
+    Returned object is a Panel template; call ``.servable()`` to serve it.
+    """
+    from ._state import AppState
+    from .ids_view import IdsView
+
+    state = AppState()
+
+    raw_page = build_raw_page()
+    ids_page = IdsView(state).view()
+
+    template = pn.template.FastListTemplate(
+        title="PTERO",
+        sidebar=[pn.pane.Markdown("### Pages\nUse the tabs in the main area to switch pages.")],
+        main=[pn.Tabs(
+            ("Raw data", raw_page),
+            ("Identifications", ids_page),
+        )],
+    )
+    return template

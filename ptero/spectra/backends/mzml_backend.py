@@ -101,6 +101,28 @@ def _scan_mobility(spec) -> float:
     return np.nan
 
 
+def _spectrum_mobility(spec) -> float:
+    """Per-spectrum 1/K0 for an ion-mobility spectrum that carries its mobility
+    *per peak* rather than as a scan-level scalar (e.g. a timsTOF run converted
+    with "Combine ion mobility scans": each MS/MS is one summed spectrum whose
+    peaks span a narrow 1/K0 window).
+
+    Such spectra expose ``ion mobility lower limit`` / ``ion mobility upper
+    limit`` cvParams (available in the metadata pass, no binary decoding). Their
+    midpoint is the precursor's representative 1/K0 -- the value the ID linker
+    uses to separate co-eluting precursors. Returns NaN when no limits are
+    present (an ordinary 3D mzML), leaving the spectrum 3D as before.
+    """
+    lo = spec.get("ion mobility lower limit")
+    hi = spec.get("ion mobility upper limit")
+    if lo is not None and hi is not None:
+        try:
+            return (float(lo) + float(hi)) / 2.0
+        except (TypeError, ValueError):
+            return np.nan
+    return np.nan
+
+
 def _precursor(spec) -> dict:
     out = {}
     try:
@@ -158,6 +180,12 @@ def _find_mobility_array_key(spec) -> Optional[str]:
 def _meta_row(spec, index: int, origin: str) -> dict:
     lvl = int(spec.get("ms level", spec.get("msLevel", 1)))
     prec = _precursor(spec)
+    # Per-spectrum 1/K0: prefer a scan-level scalar (stacked-IMS encoding); if
+    # absent, fall back to the midpoint of the spectrum's ion-mobility limits
+    # (combined-mobility timsTOF mzML, where mobility is otherwise per-peak).
+    mob = _scan_mobility(spec)
+    if mob != mob:                                # NaN -> try IM-limit midpoint
+        mob = _spectrum_mobility(spec)
     row = {
         "ms_level": lvl,
         "rtime": _scan_start_time(spec),
@@ -168,7 +196,7 @@ def _meta_row(spec, index: int, origin: str) -> dict:
         "precursor_mz": prec.get("mz", np.nan),
         "precursor_charge": prec.get("charge", pd.NA),
         "precursor_intensity": prec.get("intensity", np.nan),
-        "ion_mobility": _scan_mobility(spec),     # scan-level (NaN if none)
+        "ion_mobility": mob,                       # scan-level, else IM-limit midpoint, else NaN
     }
     row.update(_isolation_window(spec))           # isolation_mz[_lower/_upper], width
     return row
