@@ -2,7 +2,7 @@
 
 This guide takes you from nothing to viewing your own mass-spec data in the
 PTERO dashboard, on **one sample**. Follow it top to bottom. After most steps
-there is a **"You should see"** line — if you don't see that, stop and tell Ayeh
+there is a **"You should see"** line — if you don't see that, stop and tell me
 before continuing (don't push past a step that didn't work).
 
 > Everything in `this font` is a command to **type (or paste) exactly** and press Enter.
@@ -19,7 +19,7 @@ before continuing (don't push past a step that didn't work).
 4. Convert the mzML to PTERO's fast format (Zarr) and explore it in the dashboard.
 5. Load the MaxQuant results in the dashboard's Identifications tab.
 
-Steps 2 and 3 (MSConvert + MaxQuant) are the trickiest. **Ask Ayeh to be on a
+Steps 2 and 3 (MSConvert + MaxQuant) are the trickiest. **Ask me to be on a
 call with you for those two** — they're separate programs, not PTERO, and easy
 to misconfigure.
 
@@ -40,7 +40,7 @@ PTERO needs **Python << FILL IN: e.g. 3.10 or newer — check pyproject.toml >>*
    `python --version`
 
    **You should see:** `Python << FILL IN >>` (the version you installed).
-   If you see an error or a different version, tell Ayeh.
+   If you see an error or a different version, tell me.
 
 ### A2. Install Git (if you don't already have it)
 
@@ -70,7 +70,7 @@ Then clone the repository into it:
 **You should see:** Git downloading the project, ending without an error.
 A new **`PTERO`** folder now exists inside whatever folder you were in.
 
-If it asks you to log in to GitHub, use your GitHub account (the one Ayeh added
+If it asks you to log in to GitHub, use your GitHub account (the one I added
 as a collaborator).
 
 > **Remember where you put it.** From here on, the guide writes `<PTERO>` to mean
@@ -120,7 +120,7 @@ With `(ptero)` showing in your prompt, from inside the PTERO folder (`<PTERO>`):
 `python -m pytest -q`
 
 **You should see:** a row of dots / `passed` (some tests may be skipped — that's
-fine). If you see failures, copy the output and send it to Ayeh before going on.
+fine). If you see failures, copy the output and send it to me before going on.
 
 ✅ **PTERO is now installed.** You only do PART A once. Next time, you skip
 straight to activating the venv (step A4's activate line) and launching the
@@ -131,14 +131,14 @@ dashboard (PART D).
 ## PART B — Convert your `.raw` to mzML (with MSConvert)
 
 > This uses **MSConvert** (from ProteoWizard), not PTERO. You already have it.
-> **Do this on a call with Ayeh the first time.**
+> **Do this on a call with me the first time.**
 
 1. Open **MSConvert**.
 2. Add your `.raw` file.
 3. Output format: **mzML**.
 4. Add these filters (this matters — PTERO needs centroided peaks):
    - **Peak Picking** (vendor), apply to **MS levels 1–2**.
-   - << FILL IN any other MSConvert settings Ayeh wants — e.g. the exact
+   - << FILL IN any other MSConvert settings we fixed — e.g. the exact
      peak-picking settings used before. >>
 5. Set an output folder you'll remember (e.g. `C:\PTERO_data`). **Do not** put it
    inside any MaxQuant working folder.
@@ -151,15 +151,15 @@ dashboard (PART D).
 ## PART C — Identify proteins with MaxQuant
 
 > This uses **MaxQuant**, not PTERO. It's the most fiddly step.
-> **Do this on a call with Ayeh.**
+> **Do this on a call with me.**
 
 **Important rules:**
 - Give MaxQuant your original **`.raw`** file (NOT the mzML you just made).
   Using the mzML here can make MaxQuant crash at the end — use the `.raw`.
 - You need a **FASTA** protein database: << FILL IN: which organism / which
-  UniProt file Ayeh wants you to use, and where to download it. >>
+  UniProt file i wants you to use, and where to download it. >>
 
-Settings (Ayeh will confirm each on the call):
+Settings (I will confirm each on the call):
 - Load the `.raw` in the **Raw data** tab.
 - Set an **Experiment** name for the file (any short name, e.g. `sample1`).
 - **Fixed modifications:** Carbamidomethyl (C).
@@ -173,7 +173,7 @@ Settings (Ayeh will confirm each on the call):
 **You should see:** when it finishes, a **`combined`** folder, and inside it a
 **`txt`** folder containing files like `proteinGroups.txt`, `peptides.txt`,
 `msms.txt`. **The `txt` folder is what PTERO needs.** If MaxQuant finishes but
-there's no `txt` folder, tell Ayeh (it stopped early).
+there's no `txt` folder, tell me (it stopped early).
 
 ---
 
@@ -265,7 +265,7 @@ Then:
 
 - Stop at the step that failed — don't continue.
 - Copy the **exact error text** (from PowerShell or the dashboard) and send it to
-  Ayeh, along with **which step number** you were on.
+  me, along with **which step number** you were on.
 - A screenshot of the dashboard helps too.
 
 That's everything for one sample. Thanks for testing PTERO!
