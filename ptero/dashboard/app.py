@@ -34,8 +34,12 @@ import pandas as pd
 import panel as pn
 import holoviews as hv
 
-from ..spectra import PteroSpectra, MsBackendZarr, open_zarr
+from ..spectra import (PteroSpectra, MsBackendZarr, open_zarr,
+                       annotate_store_centroided, detect_centroided, from_mzml)
 from ..spectra._spectra import _assemble_qc_row
+from ..spectra._qc_metrics import compare_samples, flag_outliers, flag_summary
+from ._qc_plots import plot_zscore_heatmap, plot_flag_tally, plot_metric_strips
+from ..process import make_centroid_transform
 from .convert import convert_to_zarr, convert_many, resolve_batch_inputs
 
 pn.extension(notifications=True)
@@ -46,7 +50,14 @@ _COLOR_HELP = (
     "**Colour = summed ion intensity** in each pixel — dark → bright means "
     "low → high. The brightest spots are the most abundant ions. Colouring is "
     "histogram-equalised (it shows *relative* structure, not a linear ruler); "
-    "the numbers on the colour bar are the true summed-intensity values."
+)
+
+_FLAG_GUIDE = (
+    "**How to read this.** A flag means *worth a look*, not *a bad run* \u2014 confirm against the value in the table above.\n\n"
+    "- **Trust the per-sample tally, not single cells.** Several *related* flags on one sample (e.g. its intensity metrics) is a real signal; a lone flag usually is not.\n"
+    "- **Near-constant metrics:** a flag only fires when a value differs from the median by \u22655%, so trivial differences in settings-like metrics (m/z & RT acquisition ranges) are not flagged. If one of these *does* differ it means the **acquisition method changed** \u2014 the runs are not directly comparable, which is different from low quality.\n"
+    "- **Grouped designs:** if your samples span conditions (e.g. two groups), a metric that differs *by group* will surface the extremes as \u2018outliers\u2019 \u2014 that is biology, not a fault. Compare within each group for technical QC.\n"
+    "- `ms1Intensity*` is a PTERO extension computed on centroided MS1 and is the least standardised signal here."
 )
 
 
@@ -57,32 +68,33 @@ class Dashboard:
         self.sp: PteroSpectra | None = None
 
         # ── data-source widgets ──
+        # ── Section 1a: open an existing .zarr (one store OR a folder of stores) ──
+        self._samples: dict = {}                 # display name -> .zarr path
+        self._suspend_sample_watch = False       # guard so populating the selector doesn't auto-open
         self.zarr_path = pn.widgets.TextInput(
-            name="Zarr store path", placeholder=r"C:\data\run.zarr", width=420)
-        self.open_btn = pn.widgets.Button(name="Open Zarr", button_type="primary", width=120)
-        self.raw_path = pn.widgets.TextInput(
-            name="Raw file (.d folder or .mzML)", placeholder=r"C:\data\run.d", width=420)
-        self.out_path = pn.widgets.TextInput(
-            name="Output .zarr path", placeholder=r"C:\data\run.zarr", width=300)
+            name="A .zarr store, or a folder of .zarr stores (several paths also OK — one per line / comma-separated)",
+            placeholder=r"C:\data\run.zarr    — or —    C:\data\stores", width=620)
+        self.open_btn = pn.widgets.Button(name="Open", button_type="primary", width=120)
+
+        # ── Section 1b: convert raw data to .zarr (one file OR many, auto-detected) ──
+        self.conv_input = pn.widgets.TextInput(
+            name="A raw file (.d / .mzML), a folder of raw files, or several paths (one per line / comma-separated)",
+            placeholder=r"C:\data\run.d    — or —    C:\data\my_runs    — or —    C:\data\a.d, C:\data\b.d",
+            width=620)
+        self.conv_outdir = pn.widgets.TextInput(
+            name="Output folder for the .zarr store(s)", placeholder=r"C:\data\stores", width=320)
         self.conv_ms = pn.widgets.Select(
             name="MS level", options={"MS1": 1, "MS2": 2, "MS1 + MS2 (both)": None}, value=1, width=150)
         self.conv_frames = pn.widgets.TextInput(
             name="Frames (.d only; e.g. 0-3000; blank = all)", placeholder="0-3000", width=240)
         self.conv_batch = pn.widgets.IntInput(name="Frames/batch", value=500, start=50, step=50, width=120)
-        self.conv_btn = pn.widgets.Button(name="Convert → Zarr & open", button_type="primary", width=180)
+        self.conv_workers = pn.widgets.IntInput(
+            name="Parallel workers (many files)", value=2, start=1, end=8, step=1, width=180)
+        self.conv_overwrite = pn.widgets.Checkbox(name="Overwrite existing", value=False, width=150)
+        self.conv_btn = pn.widgets.Button(name="Convert → .zarr", button_type="primary", width=160)
 
-        # ── batch conversion (many raw files -> many Zarr stores, in parallel) ──
-        self.batch_in = pn.widgets.TextInput(
-            name="Folder of raw files, or several paths (one per line / comma-separated)",
-            placeholder=r"C:\data\my_runs    — or —    C:\data\a.d, C:\data\b.d", width=560)
-        self.batch_out = pn.widgets.TextInput(
-            name="Output folder for the .zarr stores", placeholder=r"C:\data\stores", width=320)
-        self.batch_workers = pn.widgets.IntInput(
-            name="Parallel workers", value=2, start=1, end=8, step=1, width=130)
-        self.batch_overwrite = pn.widgets.Checkbox(name="Overwrite existing", value=False, width=150)
-        self.batch_btn = pn.widgets.Button(name="Convert batch", button_type="primary", width=140)
-        self.batch_pick = pn.widgets.Select(name="Converted stores", options={}, width=420)
-        self.batch_open_btn = pn.widgets.Button(name="Open selected", button_type="success", width=140)
+        # the sample switcher (shown on the View panel only when 2+ samples are loaded)
+        self.sample_sel = pn.widgets.Select(name="Sample (view)", options=[], visible=False, width=320)
 
         self.status = pn.pane.Markdown("**No data loaded.** Open a Zarr store or convert a raw file.")
 
@@ -106,12 +118,18 @@ class Dashboard:
                                    sizing_mode="stretch_width")
 
         # ── wiring ──
-        self.open_btn.on_click(self._open_zarr)
-        self.conv_btn.on_click(self._convert_open)
-        self.batch_btn.on_click(self._convert_batch)
-        self.batch_open_btn.on_click(self._open_selected_store)
+        self.open_btn.on_click(self._open)
+        self.conv_btn.on_click(self._convert)
+        self.sample_sel.param.watch(self._on_sample_change, "value")
         self.update_btn.on_click(self._on_update)
         self.xic_btn.on_click(self._on_xic)
+
+        # ── cross-sample QC comparison (mzQC ID-free metrics across loaded samples) ──
+        self.cmp_btn = pn.widgets.Button(name="Compute comparison", button_type="primary", width=200)
+        self.cmp_panel = pn.Column(
+            pn.pane.Markdown("_Click **Compute comparison** to build the table._"),
+            sizing_mode="stretch_width")
+        self.cmp_btn.on_click(self._render_comparison)
 
     async def _show_loading(self, msg):
         """Show a spinner over the plot area and a status message, and *flush*
@@ -147,9 +165,11 @@ class Dashboard:
             immin, immax = float(q["mobility_min"][0]), float(q["mobility_max"][0])
             impad = max((immax - immin) * 0.02, 0.01)
             self.im.param.update(start=immin - impad, end=immax + impad,
-                                 value=(immin - impad, immax + impad), disabled=False)
+                                 value=(immin - impad, immax + impad),
+                                 disabled=False, visible=True)
         else:
-            self.im.disabled = True
+            # 3D data (e.g. Thermo) has no ion mobility — hide the slider entirely
+            self.im.param.update(disabled=True, visible=False)
 
         hint = ""
         if 2 in lvls:
@@ -159,22 +179,23 @@ class Dashboard:
         self.status.object = f"✅ {msg}{hint}"
         self._render()
 
-    async def _open_zarr(self, event=None):
-        path = self.zarr_path.value.strip()
-        if not path:
-            self.status.object = "⚠️ Enter a Zarr store path first."
+    async def _open(self, event=None):
+        spec = self.zarr_path.value.strip()
+        if not spec:
+            self.status.object = ("⚠️ Enter a `.zarr` store, or a folder of `.zarr` stores "
+                                  "(several paths also OK, one per line / comma-separated).")
             return
-        await self._show_loading(
-            f"⏳ Opening `{path}` and building the overview — this can take a few minutes on a "
-            "large run (every peak is read). Progress prints in the server terminal.")
-        try:
-            sp = open_zarr(path)
-            self._set_data(sp, f"Opened Zarr `{path}` — {len(sp)} spectra "
-                               f"({'4D' if sp.has_4d else '3D'}).")
-        except Exception as e:
-            self.status.object = f"❌ **Could not open Zarr:** {e}"
-        finally:
-            self.plot_panel.loading = False
+        paths = self._resolve_sample_paths(spec)
+        if not paths:
+            self.status.object = f"⚠️ No `.zarr` store found from {spec!r}."
+            return
+        names = self._register_samples(paths)
+        await self._activate_sample(names[0])
+        if len(names) > 1:
+            shown = ", ".join(f"`{n}`" for n in names[:6]) + (f" +{len(names) - 6} more"
+                                                              if len(names) > 6 else "")
+            self.status.object = (f"✅ Loaded {len(names)} samples: {shown}. Showing `{names[0]}` "
+                                  "— switch with the **Sample** selector on the View panel.")
 
     def _parse_frames(self):
         txt = self.conv_frames.value.strip()
@@ -186,52 +207,122 @@ class Dashboard:
         a, b = txt.split(sep, 1)
         return (int(a), int(b))
 
-    async def _convert_open(self, event=None):
-        src, out = self.raw_path.value.strip(), self.out_path.value.strip()
-        if not src or not out:
-            self.status.object = "⚠️ Fill in both the raw file and the output .zarr path."
+    @staticmethod
+    def _have_pyopenms() -> bool:
+        try:
+            import pyopenms  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def _convert_with_centroiding(self, src, out, *, ms_level, frames, frame_batch):
+        """Convert ``src`` -> one centroid store at ``out``.
+
+        Detects profile vs centroid; for a profile mzML it centroids inline during
+        conversion (so the profile data is never written to disk). A ``.d`` is left
+        as-is (timsTOF is already centroided), and an already-centroid level is never
+        re-picked (the peak-picker would wipe it). Returns ``(PteroSpectra, msg)``.
+        """
+        is_mzml = src.lower().endswith((".mzml", ".mzxml"))
+        if not is_mzml:
+            convert_to_zarr(src, out, ms_level=ms_level, frames=frames, frame_batch=frame_batch)
+            note = "timsTOF .d — already centroided by the instrument"
+        else:
+            # detect from the source (reads only a few spectra per level)
+            probe = from_mzml(src, ms_level=ms_level, lazy=True)
+            levels = sorted(int(x) for x in
+                            probe.spectra_data(["ms_level"])["ms_level"].dropna().unique())
+            verdict = {lvl: detect_centroided(probe, ms_level=lvl)["centroided"] for lvl in levels}
+            all_profile = bool(verdict) and all(v is False for v in verdict.values())
+            mixed = (any(v is True for v in verdict.values())
+                     and not all(bool(v) for v in verdict.values()))
+            if all_profile and self._have_pyopenms():
+                convert_to_zarr(src, out, ms_level=ms_level, frames=frames,
+                                frame_batch=frame_batch, transform=make_centroid_transform())
+                note = "mzML was profile → PTERO centroided it during conversion"
+            else:
+                convert_to_zarr(src, out, ms_level=ms_level, frames=frames, frame_batch=frame_batch)
+                if all_profile:
+                    note = ("mzML is profile and pyOpenMS isn't installed — stored as profile; "
+                            "MS2 annotation will be poor. Run `pip install pyopenms` and re-convert "
+                            "to centroid")
+                elif mixed:
+                    note = ("mixed levels (" + ", ".join(
+                        f"MS{l}:{'centroid' if v else 'profile'}" for l, v in verdict.items())
+                        + ") — stored as-is; PTERO did not centroid, to avoid wiping the "
+                        "already-centroid level")
+                else:
+                    note = "mzML already centroid — no processing needed"
+        res = annotate_store_centroided(out, force=True)   # record the FINAL status
+        sp = open_zarr(out)
+        levels = res.get("levels", {})
+        lv = ", ".join(
+            f"MS{l}:{'centroid' if (v.get('centroided') if isinstance(v, dict) else v) else 'profile'}"
+            for l, v in levels.items()) if levels else ""
+        from pathlib import Path as _P
+        msg = (f"Converted `{_P(out).name}` — {len(sp)} spectra. {note}."
+               + (f" Final: [{lv}]." if lv else ""))
+        return sp, msg
+
+    async def _convert(self, event=None):
+        """Convert raw data to .zarr. One input file -> one centroid-aware store
+        (profile mzML is centroided inline). Many files / a folder -> parallel batch
+        (each -> its own .zarr). Either way the result(s) load as switchable samples."""
+        spec = self.conv_input.value.strip()
+        outdir = self.conv_outdir.value.strip()
+        if not spec or not outdir:
+            self.status.object = "⚠️ Fill in the raw input and the output folder."
+            return
+        inputs = resolve_batch_inputs(spec)
+        if not inputs:
+            self.status.object = ("⚠️ No `.d` or `.mzML` inputs found. Give a raw file, a folder of "
+                                  "raw runs, or list the paths (one per line / comma-separated).")
             return
         try:
             frames = self._parse_frames()
         except Exception as e:
             self.status.object = f"⚠️ {e}"
             return
-        scope = f" frames {frames[0]}-{frames[1]}" if frames else " (full run)"
-        await self._show_loading(
-            f"⏳ Converting `{src}`{scope} → `{out}` in batches of {self.conv_batch.value} frames, "
-            "then building the overview. Progress prints in the server terminal — please wait…")
-        try:
-            convert_to_zarr(src, out, ms_level=self.conv_ms.value,
-                            frames=frames, frame_batch=int(self.conv_batch.value))
-            self.zarr_path.value = out
-            sp = open_zarr(out)
-            self._set_data(sp, f"Converted and opened `{out}` — {len(sp)} spectra.")
-        except Exception as e:
-            self.status.object = f"❌ **Conversion failed:** {e}"
-        finally:
-            self.plot_panel.loading = False
+        from pathlib import Path as _P
+        _P(outdir).mkdir(parents=True, exist_ok=True)
 
-    async def _convert_batch(self, event=None):
-        spec = self.batch_in.value.strip()
-        outdir = self.batch_out.value.strip()
-        if not spec or not outdir:
-            self.status.object = "⚠️ Fill in the input folder/paths and the output folder."
+        # ── one file: centroid-aware single conversion ──
+        if len(inputs) == 1:
+            src = inputs[0]
+            stem = _P(src).name
+            for suf in (".d", ".mzml", ".mzxml"):
+                if stem.lower().endswith(suf):
+                    stem = stem[: -len(suf)]
+                    break
+            out = str(_P(outdir) / (stem + ".zarr"))
+            scope = f" frames {frames[0]}-{frames[1]}" if frames else " (full run)"
+            await self._show_loading(
+                f"⏳ Converting `{src}`{scope} → `{out}`: detecting profile/centroid and, if profile, "
+                "centroiding during conversion. Progress prints in the server terminal — please wait…")
+            try:
+                sp, msg = await asyncio.to_thread(
+                    self._convert_with_centroiding, src, out,
+                    ms_level=self.conv_ms.value, frames=frames,
+                    frame_batch=int(self.conv_batch.value))
+                self._register_samples([out])
+                self._set_data(sp, msg)
+            except Exception as e:
+                self.status.object = f"❌ **Conversion failed:** {e}"
+            finally:
+                self.plot_panel.loading = False
             return
-        inputs = resolve_batch_inputs(spec)
-        if not inputs:
-            self.status.object = ("⚠️ No `.d` or `.mzML` inputs found. Give a folder containing "
-                                  "raw runs, or list the file paths (one per line / comma-separated).")
-            return
-        workers = int(self.batch_workers.value)
+
+        # ── many files: parallel batch (note: the batch path does not centroid
+        #    profile mzML — single-file conversion above does) ──
+        workers = int(self.conv_workers.value)
         await self._show_loading(
-            f"⏳ Converting {len(inputs)} file(s) with {workers} worker(s) → `{outdir}`. "
-            "Each file uses the **MS level** and **frames/batch** set above. Per-file progress "
-            "prints in the server terminal — please wait…")
+            f"⏳ Converting {len(inputs)} files with {workers} worker(s) → `{outdir}`. Each uses the "
+            "**MS level** & **frames/batch** above. Per-file progress prints in the server terminal…")
         try:
             results = await asyncio.to_thread(
                 convert_many, inputs, outdir,
                 ms_level=self.conv_ms.value, frame_batch=int(self.conv_batch.value),
-                max_workers=workers, overwrite=bool(self.batch_overwrite.value))
+                max_workers=workers, overwrite=bool(self.conv_overwrite.value))
         except Exception as e:
             self.status.object = f"❌ **Batch failed:** {e}"
             return
@@ -242,10 +333,12 @@ class Dashboard:
         err = [r for r in results if r["status"] == "error"]
         skip = [r for r in results if r["status"] == "skipped"]
         avail = [r["output"] for r in results if r["status"] in ("ok", "skipped")]
-        self.batch_pick.options = {Path(o).name: o for o in avail}
-        if avail:
-            self.batch_pick.value = avail[0]
-
+        if not avail:
+            self.status.object = "❌ Batch produced no stores. " + "; ".join(
+                f"`{_P(e['input']).name}` ({e['error']})" for e in err[:4])
+            return
+        names = self._register_samples(avail)
+        await self._activate_sample(names[0])
         parts = [f"**{len(ok)} converted**"]
         if skip:
             parts.append(f"{len(skip)} skipped (already existed)")
@@ -254,27 +347,87 @@ class Dashboard:
         msg = "✅ Batch done: " + ", ".join(parts) + f" → `{outdir}`."
         if err:
             msg += " Failed: " + "; ".join(
-                f"`{Path(e['input']).name}` ({e['error']})" for e in err[:4])
+                f"`{_P(e['input']).name}` ({e['error']})" for e in err[:4])
             if len(err) > 4:
                 msg += f"; +{len(err) - 4} more"
-        if avail:
-            msg += " — pick a store below and click **Open selected**."
+        msg += (f" — {len(avail)} store(s) loaded as **samples**; showing `{names[0]}`, switch "
+                "with the **Sample** selector on the View panel.")
         self.status.object = msg
 
-    async def _open_selected_store(self, event=None):
-        path = self.batch_pick.value
+    # ── multiple samples: open several stores, switch between them ─────────
+    @staticmethod
+    def _resolve_sample_paths(spec: str):
+        """Turn the samples field into a de-duplicated list of .zarr store paths.
+
+        Accepts a folder containing ``*.zarr`` stores, or several explicit paths
+        (one per line / comma-separated). A token ending in ``.zarr`` is taken as a
+        store; a plain folder is scanned one level deep for ``*.zarr`` stores.
+        """
+        from pathlib import Path as _P
+        tokens = [t.strip() for line in spec.splitlines()
+                  for t in line.split(",") if t.strip()]
+        found = []
+        for tok in tokens:
+            p = _P(tok)
+            if str(p).lower().endswith(".zarr"):
+                if p.exists():
+                    found.append(str(p))
+            elif p.is_dir():
+                found.extend(str(c) for c in sorted(p.iterdir())
+                             if c.is_dir() and str(c).lower().endswith(".zarr"))
+        seen, uniq = set(), []
+        for x in found:
+            if x not in seen:
+                seen.add(x)
+                uniq.append(x)
+        return uniq
+
+    def _register_samples(self, paths):
+        """Register store paths as switchable samples; populate the selector.
+
+        Populating is done with the watcher suspended so it does not auto-open a
+        store -- the caller decides when to activate one. Returns the display names.
+        """
+        from pathlib import Path as _P
+        samples: dict = {}
+        for p in paths:
+            base = _P(str(p)).name
+            name, k = base, 2
+            while name in samples:                 # disambiguate duplicate folder names
+                name = f"{base} ({k})"
+                k += 1
+            samples[name] = str(p)
+        self._samples = samples
+        names = list(samples)
+        self._suspend_sample_watch = True
+        try:
+            self.sample_sel.options = names
+            if names:
+                self.sample_sel.value = names[0]
+        finally:
+            self._suspend_sample_watch = False
+        self.sample_sel.visible = len(names) > 1   # only show the switcher for 2+ samples
+        return names
+
+    async def _activate_sample(self, name):
+        """Make the named sample the active store and re-render the View tabs."""
+        path = self._samples.get(name)
         if not path:
-            self.status.object = "⚠️ No store selected. Convert a batch first, or use **Open Zarr** above."
             return
-        await self._show_loading(f"⏳ Opening `{path}` and building the overview…")
+        await self._show_loading(f"⏳ Opening sample `{name}` and building the overview…")
         try:
             self.zarr_path.value = path
             sp = open_zarr(path)
-            self._set_data(sp, f"Opened `{path}` — {len(sp)} spectra.")
+            self._set_data(sp, f"Sample `{name}` — {len(sp)} spectra.")
         except Exception as e:
-            self.status.object = f"❌ **Open failed:** {e}"
+            self.status.object = f"❌ **Failed to open `{name}`:** {e}"
         finally:
             self.plot_panel.loading = False
+
+    async def _on_sample_change(self, event):
+        if self._suspend_sample_watch:
+            return
+        await self._activate_sample(event.new)
 
     # ── selection ──────────────────────────────────────────────────────────
     def _current_selection(self) -> PteroSpectra:
@@ -422,7 +575,8 @@ class Dashboard:
             order = np.argsort(centers[top])
             centers, vals = centers[top][order], vals[top][order]
         note = f" · top {vals.size:,} peaks" if capped else f" · {vals.size:,} peaks"
-        title = f"Spectrum — scan {i}, RT {rt_all[i]:.1f} s (summed over 1/K0){note}"
+        mob_clause = " (summed over 1/K0)" if sp.has_4d else ""
+        title = f"Spectrum — scan {i}, RT {rt_all[i]:.1f} s{mob_clause}{note}"
         ymax = float(vals.max()) if vals.size else 1.0
         return hv.Spikes((centers, vals), "m/z", ydim).opts(
             width=820, height=300, title=title, color="#1b3b6f",
@@ -739,6 +893,95 @@ class Dashboard:
             return pn.pane.Markdown(f"❌ **Window-scheme view error:** {e}")
 
     # ── render everything ──────────────────────────────────────────────────
+    async def _render_comparison(self, event=None):
+        """Compute mzQC ID-free metrics for every loaded sample, tabulate, flag outliers."""
+        names = list(self._samples)
+        if len(names) < 2:
+            self.cmp_panel[:] = [pn.pane.Markdown(
+                "_Load 2+ samples (open a folder of .zarr stores, or several paths) to compare._")]
+            return
+        self.cmp_panel.loading = True
+        try:
+            opened = {n: open_zarr(p) for n, p in self._samples.items()}
+            tbl = compare_samples(opened)
+            flags = flag_outliers(tbl, names)
+            summary = flag_summary(flags, names)
+            self.cmp_panel[:] = self._comparison_panels(tbl, flags, summary, names)
+        except Exception as e:
+            self.cmp_panel[:] = [pn.pane.Markdown(f"❌ **Comparison error:** {e}")]
+        finally:
+            self.cmp_panel.loading = False
+
+    @staticmethod
+    def _format_comparison(tbl, names):
+        """Format the comparison matrix for display (metric as row label, %.4g cells)."""
+        disp = tbl.copy()
+        for c in list(names) + (["cv_pct"] if "cv_pct" in disp.columns else []):
+            disp[c] = disp[c].map(lambda v: "" if pd.isna(v) else f"{v:.4g}")
+        if "ms_level" in disp.columns:
+            disp["ms_level"] = disp["ms_level"].map(lambda v: "" if pd.isna(v) else str(int(v)))
+        return disp.set_index("metric")
+
+    # outlier-cell colours: agreement of both methods is the strongest signal
+    _FLAG_COLORS = {"both": "#f3a3a3", "z": "#ffd6a0", "iqr": "#fff2a8"}
+
+    def _comparison_panels(self, tbl, flags, summary, names):
+        """Assemble the comparison tab: highlighted matrix + legend + tally + detail."""
+        disp = self._format_comparison(tbl, names)
+        style = pd.DataFrame("", index=disp.index, columns=disp.columns)
+        for _, f in flags.iterrows():
+            key = "both" if (f["flag_z"] and f["flag_iqr"]) else ("z" if f["flag_z"] else "iqr")
+            if f["metric"] in style.index and f["sample"] in style.columns:
+                style.loc[f["metric"], f["sample"]] = (
+                    f"background-color: {self._FLAG_COLORS[key]}; font-weight: 600")
+        html = (disp.style.apply(lambda _: style, axis=None)
+                    .set_table_styles([{"selector": "td, th",
+                                        "props": [("padding", "2px 8px"),
+                                                  ("font-size", "12px")]}])
+                    .to_html())
+        legend = pn.pane.HTML(
+            "<b>Outlier flags</b> &mdash; "
+            "<span style='background:#f3a3a3'>&nbsp;both methods&nbsp;</span> "
+            "<span style='background:#ffd6a0'>&nbsp;z-score only&nbsp;</span> "
+            "<span style='background:#fff2a8'>&nbsp;IQR only&nbsp;</span>. "
+            "Modified z-score (median/MAD, |z|&gt;3.5) and Tukey fences (Q1/Q3 ± 1.5·IQR), "
+            "per metric across samples. Flags require a \u22655% deviation from the median, "
+            "so trivial differences are ignored. <code>cv_pct</code> is spread only (not "
+            "flagged). Metrics with &lt;3 samples are not evaluated.")
+        if flags.empty:
+            detail = pn.pane.Markdown("_No samples flagged as outliers on any metric._")
+        else:
+            d = flags.copy()
+            d["robust_z"] = d["robust_z"].map(lambda v: f"{v:.2f}")
+            d["dev_pct"] = d["rel_dev"].map(lambda v: f"{v * 100:.1f}%")
+            d["value"] = d["value"].map(lambda v: f"{v:.4g}")
+            d["by"] = d.apply(lambda r: "both" if (r["flag_z"] and r["flag_iqr"])
+                              else ("z" if r["flag_z"] else "IQR"), axis=1)
+            detail = pn.pane.DataFrame(
+                d[["metric", "sample", "value", "robust_z", "dev_pct", "direction", "by"]].reset_index(drop=True),
+                width=720, index=False)
+        plot_panes = [
+            pn.pane.Matplotlib(plot_zscore_heatmap(tbl, names, flags), format="png",
+                               dpi=96, sizing_mode="stretch_width"),
+            pn.pane.Matplotlib(plot_flag_tally(summary), format="png", dpi=96),
+        ]
+        if not flags.empty:
+            plot_panes.append(pn.pane.Matplotlib(
+                plot_metric_strips(tbl, names, flags), format="png", dpi=96,
+                sizing_mode="stretch_width"))
+        plots_card = pn.Card(*plot_panes, title="Plots", collapsed=True,
+                             sizing_mode="stretch_width")
+        return [
+            pn.pane.HTML(html, styles={"overflow-x": "auto", "max-width": "100%"}),
+            legend,
+            pn.pane.Markdown(_FLAG_GUIDE),
+            pn.pane.Markdown("**Per-sample outlier tally** (most-flagged first):"),
+            pn.pane.DataFrame(summary, width=720, index=False),
+            pn.pane.Markdown("**Flagged metric–sample pairs:**"),
+            detail,
+            plots_card,
+        ]
+
     def _render(self, event=None):
         if self.sp is None:
             return
@@ -815,6 +1058,14 @@ class Dashboard:
                     "for the **whole run**. The peak-derived metrics and the RT / m/z / 1/K0 ranges reflect "
                     "the **current MS-level + range selection**._"))))
 
+            if len(self._samples) > 1:
+                tabs.append(("Sample comparison", pn.Column(
+                    pn.Row(self.cmp_btn, pn.pane.Markdown(
+                        "_mzQC ID-free metrics for every loaded sample, computed on each sample's "
+                        "full data. `cv_pct` is the spread across samples — a high value flags a "
+                        "metric that differs between runs. Per-sample outlier flagging comes next._")),
+                    self.cmp_panel, sizing_mode="stretch_width")))
+
             self.plot_panel[:] = [pn.Tabs(*tabs)]
         except Exception as e:
             self.plot_panel[:] = [pn.pane.Markdown(f"❌ **Render error:** {e}")]
@@ -843,23 +1094,37 @@ class Dashboard:
     # ── layout ─────────────────────────────────────────────────────────────
     def view(self):
         from ._browse import browse_field
-        source = pn.Column(
-            pn.pane.Markdown("## 1 · Data source"),
-            browse_field(self.zarr_path, patterns=["*.zarr"], width=560),
-            pn.Row(pn.Column(pn.Spacer(height=18), self.open_btn)),
-            pn.pane.Markdown("— or convert a raw file —"),
-            browse_field(self.raw_path, patterns=["*.d", "*.mzML"], width=560),
-            pn.Row(browse_field(self.out_path, patterns=["*.zarr"], width=420),
-                   self.conv_ms, self.conv_frames, self.conv_batch,
+        open_help = ("One .zarr store, or a folder of .zarr stores to load several samples at once "
+                     "(several paths also work — one per line or comma-separated). With 2+ samples, "
+                     "switch between them with the Sample selector on the View panel.")
+        convert_help = ("One raw file converts to a single store; a folder or several paths convert "
+                        "in parallel, each to its own .zarr. The result(s) load as samples. PTERO "
+                        "detects profile vs centroid: a .d is already centroid (instrument peak-picked), "
+                        "and a single profile mzML is centroided on convert (needs pyopenms). Note: the "
+                        "parallel path does not centroid profile mzML yet — convert those one at a time "
+                        "for now.")
+        open_section = pn.Column(
+            pn.Row(pn.pane.Markdown("## 1 · Open .zarr"),
+                   pn.widgets.TooltipIcon(value=open_help), align="center"),
+            pn.Row(browse_field(self.zarr_path, patterns=["*.zarr"], width=620),
+                   pn.Column(pn.Spacer(height=18), self.open_btn)),
+            sizing_mode="stretch_width")
+        convert_section = pn.Column(
+            pn.Row(pn.pane.Markdown("## 2 · Convert to .zarr"),
+                   pn.widgets.TooltipIcon(value=convert_help), align="center"),
+            browse_field(self.conv_input, patterns=["*.d", "*.mzML"], width=620),
+            pn.Row(self.conv_outdir, self.conv_ms, self.conv_frames, self.conv_batch),
+            pn.Row(self.conv_workers, self.conv_overwrite,
                    pn.Column(pn.Spacer(height=18), self.conv_btn)),
-            pn.pane.Markdown("— or convert many raw files in parallel "
-                             "(each → its own .zarr; uses the MS level & frames/batch above) —"),
-            pn.Row(self.batch_in, self.batch_out, self.batch_workers, self.batch_overwrite,
-                   pn.Column(pn.Spacer(height=18), self.batch_btn)),
-            pn.Row(self.batch_pick, pn.Column(pn.Spacer(height=18), self.batch_open_btn)),
+            sizing_mode="stretch_width")
+        source = pn.Column(
+            open_section,
+            pn.layout.Divider(),
+            convert_section,
             self.status, sizing_mode="stretch_width")
         controls = pn.Column(
-            pn.pane.Markdown("## 2 · View"),
+            pn.pane.Markdown("## 3 · View"),
+            self.sample_sel,
             self.ms_sel, self.rt, self.mz, self.im, self.update_btn, width=340)
         return pn.Column(
             pn.pane.Markdown("# PTERO — Raw Data Dashboard"),

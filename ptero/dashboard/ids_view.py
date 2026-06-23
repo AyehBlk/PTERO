@@ -1,11 +1,12 @@
 """
 ID-annotation page for the PTERO dashboard.
 
-Workflow (input is **mzML**, not Zarr — see note):
+Workflow (spectra source: a PTERO ``.zarr`` store **or** an mzML):
 
-1. Load a vendor-peak-picked **mzML** as the spectra store, plus a search-engine
-   ``msms.txt`` (PSMs). Optionally ``accumulatedMsmsScans.txt`` (per-PSM 1/K0)
-   and ``summary.txt`` (the search's fixed/variable mods).
+1. Load a spectra store -- a PTERO ``.zarr`` (raw or processed) or a vendor
+   peak-picked **mzML** -- plus a search-engine ``msms.txt`` (PSMs). Optionally
+   ``accumulatedMsmsScans.txt`` (per-PSM 1/K0) and ``summary.txt`` (the search's
+   fixed/variable mods).
 2. PSMs are listed in a selectable table.
 3. Selecting a PSM locates its MS2 spectrum in the store by physical coordinates
    (RT + precursor m/z + ion mobility), annotates the b/y ions, and shows:
@@ -16,10 +17,13 @@ Workflow (input is **mzML**, not Zarr — see note):
      around the PSM (the "raw data" view of where this identification elutes);
    * the PSM's coordinates and the fragment-coverage score.
 
-Why mzML and not the Zarr store: a raw ``.d``→Zarr store holds un-deisotoped
-peaks, whose fragment m/z do not match a search engine's monoisotopic ``Masses``.
-The vendor-peak-picked mzML does. (When PTERO grows its own MS/MS processing
-step, the Zarr store could feed this too.)
+Spectra source -- Zarr or mzML: the link is property-based (RT + precursor m/z +
+1/K0) and the annotator matches b/y ions to the nearest peak within tolerance, so
+it works directly on a PTERO ``.zarr`` store whose MS2 spectra are centroided
+(verified on real timsTOF data: deisotoping is not required because the
+monoisotopic fragment peak is present and is the nearest match). A vendor
+peak-picked mzML also works. Using the ``.zarr`` keeps everything in PTERO's store
+and removes the separate mzML (and the MSConvert step that produced it).
 """
 from __future__ import annotations
 
@@ -62,8 +66,9 @@ class IdsView:
         self._coverage_sites = []    # sites for the currently shown protein
 
         # ── inputs ──
-        self.mzml_path = pn.widgets.TextInput(
-            name="mzML store (vendor peak-picked)", placeholder=r"C:\data\run.mzML", width=460)
+        self.store_path = pn.widgets.TextInput(
+            name="Spectra store (PTERO .zarr — raw/processed — or vendor mzML)",
+            placeholder=r"C:\data\run.zarr   or   C:\data\run.mzML", width=460)
         self.txt_dir = pn.widgets.TextInput(
             name="MaxQuant txt folder",
             placeholder=r"C:\data\combined\txt", width=460)
@@ -73,8 +78,8 @@ class IdsView:
         self.load_btn = pn.widgets.Button(name="Load identifications", button_type="primary", width=170)
 
         self.status = pn.pane.Markdown(
-            "**No identifications loaded.** Enter the mzML store and the MaxQuant "
-            "`txt` folder, then Load.")
+            "**No identifications loaded.** Enter a spectra store (PTERO `.zarr` or "
+            "mzML) and the MaxQuant `txt` folder, then Load.")
 
         # ── protein table (top, selectable) ──
         self.protein_table = pn.widgets.Tabulator(
@@ -112,10 +117,10 @@ class IdsView:
     # ── loading ──────────────────────────────────────────────────────────
     async def _on_load(self, event=None):
         from pathlib import Path
-        mzml = self.mzml_path.value.strip()
+        store_path = self.store_path.value.strip()
         txt_dir = self.txt_dir.value.strip()
-        if not (mzml and txt_dir):
-            self.status.object = "⚠️ Enter the mzML store and the MaxQuant `txt` folder."
+        if not (store_path and txt_dir):
+            self.status.object = "⚠️ Enter a spectra store (.zarr or mzML) and the MaxQuant `txt` folder."
             return
         folder = Path(txt_dir)
         if not folder.is_dir():
@@ -160,11 +165,10 @@ class IdsView:
         self.spectrum_panel.loading = True
         await asyncio.sleep(0.05)
         try:
-            from ..spectra import from_mzml
             from .. import ids
             from ._ids_data import IdentificationData
 
-            store = from_mzml(mzml)                       # lazy; metadata pass only
+            store = _open_spectra_store(store_path)       # PTERO .zarr or mzML (lazy)
             psms = ids.read_psms(msms)
             n_mob = ids.attach_mobility_from_maxquant(psms, accum) if accum else 0
             n_mod = ids.convert_psm_modifications(psms, summary_path=summary)
@@ -213,7 +217,8 @@ class IdsView:
                           if self._fasta else " No FASTA (coverage map off).")
             self.status.object = (
                 f"✅ Loaded {len(psms)} PSMs, {n_groups} protein groups, "
-                f"mzML store ({len(store)} spectra). 1/K0 on {n_mob}; mods on {n_mod}.{fasta_note} "
+                f"spectra store ({len(store)} spectra, {'4D' if store.has_4d else '3D'}). "
+                f"1/K0 on {n_mob}; mods on {n_mod}.{fasta_note} "
                 f"Select a protein, then a peptide."
                 + (f"  _(optional not found: {', '.join(opt_note)})_" if opt_note else ""))
         except Exception as e:
@@ -546,7 +551,7 @@ class IdsView:
         from ._browse import browse_field
         inputs = pn.Column(
             pn.pane.Markdown("## Identifications"),
-            browse_field(self.mzml_path, patterns=["*.mzML"], width=560),
+            browse_field(self.store_path, patterns=["*.zarr", "*.mzML", "*.mzXML"], width=560),
             browse_field(self.txt_dir, pick_folder=True, width=560),
             browse_field(self.fasta_path, patterns=["*.fasta", "*.fa"], width=560),
             pn.Row(self.load_btn),
@@ -574,3 +579,16 @@ class IdsView:
 def ids_peak_annotations(mz, intensity, proforma, charge):
     from .. import ids
     return ids.peak_annotations(mz, intensity, proforma, charge)
+
+
+def _open_spectra_store(path: str):
+    """Open the ID page's spectra source: a PTERO Zarr store when the path is a
+    ``.zarr`` (or a directory holding a PTERO store), else an mzML/mzXML via
+    ``from_mzml``. Both return a ``PteroSpectra``, so the link, annotation and XIC
+    code downstream is identical regardless of source."""
+    from pathlib import Path
+    from ..spectra import open_zarr, from_mzml
+    p = Path(path)
+    if p.suffix.lower() == ".zarr" or (p.is_dir() and (p / "offsets").exists()):
+        return open_zarr(str(p))
+    return from_mzml(str(p))

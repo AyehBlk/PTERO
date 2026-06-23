@@ -560,42 +560,31 @@ class PteroSpectra:
         be = MsBackendMemory.from_spectra_list(pd.DataFrame(meta_rows), out_peaks)
         return PteroSpectra(be)
 
-    def centroid_check(self, n_check: int = 5) -> dict:
+    def centroid_check(self, n_check: int = 5, ms_level=None) -> dict:
         """Inspect whether peaks look centroided, and *show the basis*.
 
-        Samples up to ``n_check`` spectra and measures the median spacing between
-        consecutive m/z values. Returns ``{'median_mz_spacing', 'centroided',
-        'n_spectra_checked'}``. Profile data is densely, uniformly sampled (tiny
-        median spacing, e.g. ~0.001-0.005 Da); centroided data is sparse with a
-        larger, irregular median spacing. The verdict uses a 0.01 Da cutoff (set
-        between the ~0.02 median of centroided high-res data and the ~0.002-0.005
-        of profile data) but the returned spacing lets you judge borderline cases
-        yourself -- the definitive status comes from instrument/file metadata.
+        For 4D data this measures m/z spacing WITHIN a single ion-mobility (1/K0)
+        slice; pooling a whole frame across mobility scans would make even
+        centroided data look densely sampled, so the pooled spacing is not a valid
+        4D verdict (it is reported separately by the diagnostic). For 3D data it
+        measures the spectrum's m/z array directly. Profile data has a tiny, regular
+        spacing (~0.001-0.01 Da); centroided data is sparse (> ~0.01 Da). Returns
+        ``{'median_mz_spacing', 'centroided', 'basis', 'n_spectra_checked',
+        'ms_level'}``; the 0.01 Da cutoff is heuristic and the definitive status
+        comes from instrument/file metadata. ``ms_level`` restricts the check to one
+        level.
         """
-        if len(self) == 0:
-            return {"median_mz_spacing": float("nan"), "centroided": True, "n_spectra_checked": 0}
-        idx = np.unique(np.linspace(0, len(self) - 1, min(n_check, len(self))).astype(int))
-        spacings = []
-        for i in idx:
-            mz = self.mz([int(i)])[0]
-            mz = np.unique(mz[mz > 0])
-            if mz.size > 10:
-                spacings.append(float(np.median(np.diff(mz))))
-        if not spacings:
-            return {"median_mz_spacing": float("nan"), "centroided": True,
-                    "n_spectra_checked": 0}
-        med = float(np.median(spacings))
-        return {"median_mz_spacing": med, "centroided": med > 0.01,
-                "n_spectra_checked": len(spacings)}
+        from ._centroid import measure_centroided
+        return measure_centroided(self, ms_level=ms_level, n_check=n_check)
 
-    def is_centroided(self, n_check: int = 5) -> bool:
+    def is_centroided(self, n_check: int = 5, ms_level=None) -> bool:
         """Heuristic bool: do the peaks look centroided (sparse) vs profile?
 
         Thin wrapper over :meth:`centroid_check` -- call that to also see the
-        measured m/z spacing the verdict is based on. Heuristic, not
-        authoritative; the definitive status comes from the instrument/file.
+        measured m/z spacing and the ``basis`` the verdict is based on. Heuristic,
+        not authoritative; the definitive status comes from the instrument/file.
         """
-        return self.centroid_check(n_check)["centroided"]
+        return bool(self.centroid_check(n_check, ms_level)["centroided"])
 
     # ── raw-data QC (per-run quality summary) ────────────────────────────
     def qc(self, max_spectra: Optional[int] = None) -> pd.DataFrame:

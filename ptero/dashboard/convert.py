@@ -36,6 +36,7 @@ def _is_bruker_d(path: str) -> bool:
 def convert_to_zarr(input_path, output_path, ms_level: Optional[int] = 1,
                     frames: Optional[tuple] = None, frame_batch: int = 500,
                     spectrum_batch: int = 2000,
+                    transform: Optional[Callable[[dict], dict]] = None,
                     progress: Optional[Callable[[str], None]] = None,
                     log_prefix: Optional[str] = None) -> str:
     """Read a raw run in batches and stream it to a Zarr store; return the path.
@@ -56,6 +57,11 @@ def convert_to_zarr(input_path, output_path, ms_level: Optional[int] = 1,
         Bruker only -- frames read per batch. Smaller uses less memory.
     spectrum_batch : int, default 2000
         mzML only -- spectra read per batch.
+    transform : callable, optional
+        A per-spectrum ``peaks_dict -> peaks_dict`` map applied during conversion
+        (e.g. ``ptero.process.make_centroid_transform()`` to centroid profile data
+        inline, so the store is written centroid with no profile intermediate).
+        mzML only; raises for Bruker ``.d`` (already centroided).
     progress : callable, optional
         Called with short status strings as conversion proceeds.
     log_prefix : str, optional
@@ -76,9 +82,13 @@ def convert_to_zarr(input_path, output_path, ms_level: Optional[int] = 1,
                 pass
 
     if _is_bruker_d(p):
+        if transform is not None:
+            raise NotImplementedError(
+                "transform/centroiding is for mzML profile data; a Bruker .d is "
+                "already centroided and does not need it.")
         return _convert_bruker(p, out, ms_level, frames, frame_batch, _log)
     if p.lower().endswith((".mzml", ".mzxml")):
-        return _convert_mzml(p, out, ms_level, spectrum_batch, _log)
+        return _convert_mzml(p, out, ms_level, spectrum_batch, _log, transform=transform)
     raise ValueError(
         f"Unsupported input {p!r}; expected a Bruker .d folder or a .mzML/.mzXML file."
     )
@@ -230,7 +240,7 @@ def _convert_bruker_dia(data, path, out, ms_level, frames, frame_batch, n_frames
     return out
 
 
-def _convert_mzml(path, out, ms_level, spectrum_batch, _log) -> str:
+def _convert_mzml(path, out, ms_level, spectrum_batch, _log, transform=None) -> str:
     _log(f"opening {path} …")
     sp = from_mzml(path, ms_level=ms_level, lazy=True)
     n = len(sp)
@@ -240,7 +250,8 @@ def _convert_mzml(path, out, ms_level, spectrum_batch, _log) -> str:
     cols = ("mz", "intensity", "ion_mobility") if has_4d else ("mz", "intensity")
     meta_all = sp.spectra_data()              # metadata is tabular and small enough to hold
     _log(f"reading {n} spectra in batches of {spectrum_batch}"
-         + (" (4D)" if has_4d else " (3D)"))
+         + (" (4D)" if has_4d else " (3D)")
+         + (" with inline transform" if transform is not None else ""))
 
     writer = _ZarrStreamWriter(out, has_4d=has_4d)
     for s in range(0, n, spectrum_batch):
@@ -251,6 +262,8 @@ def _convert_mzml(path, out, ms_level, spectrum_batch, _log) -> str:
             d = {"mz": pk[:, 0], "intensity": pk[:, 1]}
             if has_4d:
                 d["ion_mobility"] = pk[:, 2]
+            if transform is not None:
+                d = transform(d)
             batch.append(d)
         mem = MsBackendMemory.from_spectra_list(
             meta_all.iloc[s:ee].reset_index(drop=True), batch

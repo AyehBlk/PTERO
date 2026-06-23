@@ -19,21 +19,30 @@ venv/
 *.mzXML
 combined/
 
+# Generated data / validation outputs — regenerable, keep out of Git
+*.csv
+
+# R session files
+.Rhistory
+*.Rhistory
+
 # OS / editor
 .DS_Store
 .vscode/
+
+# Private status/strategy docs — not for the shared repo
+/docs/
+
 # Personal scratch / scripts not part of the package
+scratch_*.py
 /crosscheck_alphatims.py
 /inspect_dia.py
 /run_checks.py
 /try_hela.py
+/annotate_my_store.py
+/inspect_centroiding.py
+/pride_metadata.py
+/README_v1.md
+/validation/
 
-# Private status/strategy docs — not for the shared repo
-/docs/
-scratch_*.py
-# append a rule to .gitignore
-Add-Content .gitignore "`nscratch_*.py"
-
-scratch_*.py
-
-scratch_*.py
+/tests/centroid_raw_test.py
