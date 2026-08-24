@@ -46,3 +46,4 @@ scratch_*.py
 /validation/
 
 /tests/centroid_raw_test.py
+scratch/
