@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/ptero-logo.png" alt="PTERO" width="320">
+  <img src="assets/pterosaur.avif" alt="PTERO" width="320">
 </p>
 
 # PTERO
