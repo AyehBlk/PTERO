@@ -45,6 +45,7 @@ from ._contaminants import annotate_contaminants
 from ._de import (
     complete_case_matrix,
     de_concordance,
+    deqms_de,
     differential_abundance,
     limma_de,
     plot_onoff,
@@ -53,6 +54,8 @@ from ._de import (
     wilcoxon_de,
 )
 from ._impute import impute_matrix, impute_minprob, impute_qrilc
+from ._deviz import (detection_matrix, heatmap_top, plot_de_boxplot,
+                     save_de_boxplots, volcano)
 
 __all__ = [
     # core
@@ -81,6 +84,7 @@ __all__ = [
     "presence_absence",
     "plot_onoff",
     "limma_de",
+    "deqms_de",
     "welch_de",
     "wilcoxon_de",
     "differential_abundance",
@@ -89,6 +93,11 @@ __all__ = [
     "impute_matrix",
     "impute_qrilc",
     "impute_minprob",
+    "volcano",
+    "detection_matrix",
+    "heatmap_top",
+    "plot_de_boxplot",
+    "save_de_boxplots",
     "MECHANISM_ORDER",
     "DIAGNOSE_COLORS",
     "UNDETECTED",

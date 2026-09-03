@@ -369,6 +369,14 @@ def load_quant(
     else:
         n_filtered["rows_dropped"] = 0
 
+    # guard: drop rows whose 'id' isn't a valid integer (e.g. a truncated final
+    # line in the export). Warn rather than fail the whole load or drop silently.
+    id_ok = pd.to_numeric(df["id"], errors="coerce").notna()
+    if not id_ok.all():
+        warnings.warn(f"dropped {int((~id_ok).sum())} row(s) with a blank/non-integer "
+                      f"'id' (likely a truncated line).", stacklevel=2)
+        df = df[id_ok].reset_index(drop=True)
+
     ids = pd.to_numeric(df["id"], errors="raise").astype("int64")
     if ids.duplicated().any():
         warnings.warn("duplicate protein-group ids found; matrices will have a "

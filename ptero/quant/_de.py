@@ -520,7 +520,167 @@ def wilcoxon_de(matrix: pd.DataFrame, groups, *, ref_group: str) -> pd.DataFrame
 # Dispatcher: run a set of DE methods across the complete-case and imputed tracks.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DE_METHODS = ("limma", "welch", "wilcoxon")
+# ─────────────────────────────────────────────────────────────────────────────
+# DEqMS: limma fit + count-dependent variance moderation (Zhu et al. 2020).
+#
+# A faithful port of DEqMS::spectraCounteBayes. Same linear fit as limma, but the
+# variance prior is a function of the per-protein peptide/PSM count: fit a trend of
+# log(residual variance) vs log2(count), then estimate the prior df by Sartor's
+# IBMT moment-matching and form a per-protein posterior variance from the trend.
+# A protein quantified from many peptides gets a tighter, more confident variance.
+# Runs on a COMPLETE matrix (complete-case or an imputed track), like limma.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _loess_predict(x, y, *, span: float = 0.75, degree: int = 2):
+    """Local weighted polynomial regression (R loess: degree-2, tricube weights,
+    nearest-neighbour bandwidth = span fraction of points). Fitted values at ``x``.
+
+    Peptide counts are integers, so ``x = log2(count)`` takes few distinct values;
+    we fit once per distinct x and map back -- exact and fast (no interpolation).
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = x.size
+    q = int(min(max(int(np.ceil(span * n)), degree + 1), n))
+    xu = np.unique(x)
+    pred_u = np.empty(xu.size)
+    for k, x0 in enumerate(xu):
+        d = np.abs(x - x0)
+        h = np.partition(d, q - 1)[q - 1]
+        h = h if h > 0 else (d.max() if d.max() > 0 else 1.0)
+        u = np.clip(d / h, 0.0, 1.0)
+        w = (1.0 - u ** 3) ** 3
+        nz = w > 0
+        Xp = np.vander(x[nz] - x0, degree + 1, increasing=True)
+        W = w[nz]
+        XtWX = Xp.T @ (W[:, None] * Xp)
+        XtWy = Xp.T @ (W * y[nz])
+        try:
+            beta = np.linalg.solve(XtWX, XtWy)
+            pred_u[k] = beta[0]                      # intercept = value at x0
+        except np.linalg.LinAlgError:
+            pred_u[k] = float(np.average(y[nz], weights=W))
+    return pred_u[np.searchsorted(xu, x)]
+
+
+def _deqms_prior_df(mean_myfct: float, numgenes: int):
+    """Grid-search the prior df d0 so trigamma(d0/2) matches the mean trend-residual
+    (DEqMS spectraCounteBayes: step d0 by 0.1, stop once the objective turns up)."""
+    from scipy.special import polygamma
+
+    priordf = []
+    for i in range(1, numgenes * 10 + 1):
+        d0i = i / 10.0
+        priordf.append(abs(mean_myfct - float(polygamma(1, d0i / 2.0))))
+        if i > 2 and priordf[i - 3] < priordf[i - 2]:
+            break
+    j = int(np.argmin(priordf))
+    return (j + 1) / 10.0
+
+
+def deqms_de(matrix: pd.DataFrame, groups, counts, *, ref_group: str,
+             covariates=None, fit_method: str = "loess") -> pd.DataFrame:
+    """DEqMS moderated t-test for a two-group contrast on a complete matrix.
+
+    Same as :func:`limma_de` plus a count-dependent variance prior.
+
+    Parameters
+    ----------
+    matrix : DataFrame
+        proteins x samples, no missing values (complete-case or imputed).
+    groups : mapping {sample -> group}; ``ref_group`` sets the contrast direction.
+    counts : Series/array
+        Per-protein peptide (or PSM) count, aligned to (or indexable by)
+        ``matrix.index`` -- e.g. ``qd.proteins['razor_unique_peptides']`` or the
+        per-sample minimum. A count of 0 gets a pseudocount of 1 (DEqMS).
+    covariates : mapping {sample -> value}, optional -- one categorical covariate.
+    fit_method : {"loess", "spline", "nls"} -- the variance-vs-count trend.
+
+    Returns
+    -------
+    DataFrame indexed by protein id with ``log2FC``, ``AveExpr``, ``t`` (count-
+    moderated), ``p``, ``padj`` (BH), ``count`` and ``df_total``. ``.attrs`` records
+    the prior df, contrast and fit method.
+    """
+    from scipy import stats
+    from scipy.special import digamma, polygamma      # trigamma(z) = polygamma(1, z)
+
+    samples = list(matrix.columns)
+    X, ci, coef_name = _design_matrix(samples, groups, ref_group, covariates)
+    Y = matrix.to_numpy(dtype=float)
+    if np.isnan(Y).any():
+        raise ValueError("deqms_de requires a complete matrix (no NaN); impute or "
+                         "use the complete-case matrix first.")
+    cnt = pd.Series(counts).reindex(matrix.index).to_numpy(dtype=float)
+    if np.isnan(cnt).any():
+        raise ValueError("counts contain NaN for some proteins in the matrix; "
+                         "provide a peptide/PSM count for every protein.")
+    if cnt.min() == 0:
+        cnt = cnt + 1.0                                # DEqMS pseudocount
+
+    n = X.shape[0]
+    XtX_inv = np.linalg.inv(X.T @ X)
+    beta = XtX_inv @ X.T @ Y.T
+    resid = Y.T - X @ beta
+    df = n - np.linalg.matrix_rank(X)
+    sigma2 = np.sum(resid ** 2, axis=0) / df
+    stdev_unscaled = float(np.sqrt(XtX_inv[ci, ci]))
+    coef = beta[ci, :]
+
+    # guard exact-zero variance (identical rows) before the log
+    floor = np.nanmin(sigma2[sigma2 > 0]) * 1e-6 if np.any(sigma2 > 0) else 1e-12
+    logVAR = np.log(np.maximum(sigma2, floor))
+
+    if fit_method == "loess":
+        y_pred = _loess_predict(np.log2(cnt), logVAR, span=0.75, degree=2)
+    elif fit_method == "spline":
+        from scipy.interpolate import UnivariateSpline
+        x = np.log2(cnt)
+        o = np.argsort(x)
+        y_pred = np.empty_like(logVAR)
+        y_pred[o] = UnivariateSpline(x[o], logVAR[o], k=3)(x[o])
+    elif fit_method == "nls":
+        from scipy.optimize import curve_fit
+        popt, _ = curve_fit(lambda xx, a, b: a + b / xx, cnt, sigma2,
+                            p0=[0.1, 0.05], maxfev=10000)
+        y_pred = np.log(np.maximum(popt[0] + popt[1] / cnt, floor))
+    else:
+        raise ValueError(f"fit_method must be 'loess' | 'spline' | 'nls', got {fit_method!r}.")
+
+    # Sartor IBMT: prior df from the trend residuals, count-dependent prior variance
+    eg = logVAR - digamma(df / 2.0) + np.log(df / 2.0)
+    egpred = y_pred - digamma(df / 2.0) + np.log(df / 2.0)
+    myfct = (eg - egpred) ** 2 - float(polygamma(1, df / 2.0))
+    mean_myfct = float(np.nanmean(myfct))
+    d0 = _deqms_prior_df(mean_myfct, int(np.isfinite(logVAR).sum()))
+    s2_0 = np.exp(egpred + digamma(d0 / 2.0) - np.log(d0 / 2.0))   # per-protein prior
+
+    post_var = (d0 * s2_0 + df * sigma2) / (d0 + df)
+    post_df = df + d0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t = coef / (stdev_unscaled * np.sqrt(post_var))
+    p = 2.0 * stats.t.sf(np.abs(t), post_df)
+
+    out = pd.DataFrame(index=matrix.index)
+    out.index.name = matrix.index.name or "id"
+    out["log2FC"] = coef
+    out["AveExpr"] = Y.mean(axis=1)
+    out["t"] = t
+    out["p"] = p
+    out["padj"] = _bh(p)
+    out["count"] = cnt
+    out["df_total"] = post_df
+    out.attrs["method"] = "deqms"
+    out.attrs["contrast"] = coef_name
+    out.attrs["df_prior"] = d0
+    out.attrs["df_residual"] = df
+    out.attrs["fit_method"] = fit_method
+    return out
+
+
+_DE_METHODS = ("limma", "welch", "wilcoxon")              # default suite
+_DE_METHODS_ALL = ("limma", "deqms", "welch", "wilcoxon")  # deqms is opt-in (needs counts)
 _DE_TRACKS = ("complete_case", "imputed_mechanism", "imputed_minprob")
 
 
@@ -537,6 +697,8 @@ def differential_abundance(
     qrilc_tune_sigma: float = 1.0,
     minprob_width: float = 0.3,
     minprob_downshift: float = 1.8,
+    counts=None,
+    deqms_fit_method: str = "loess",
     seed: int = 1,
 ) -> pd.DataFrame:
     """Run several DE methods across the DE tracks and return one tidy table.
@@ -556,10 +718,10 @@ def differential_abundance(
     """
     methods = tuple(methods)
     tracks = tuple(tracks)
-    bad_m = set(methods) - set(_DE_METHODS)
+    bad_m = set(methods) - set(_DE_METHODS_ALL)
     bad_t = set(tracks) - set(_DE_TRACKS)
     if bad_m:
-        raise ValueError(f"unknown method(s) {sorted(bad_m)}; choose from {_DE_METHODS}.")
+        raise ValueError(f"unknown method(s) {sorted(bad_m)}; choose from {_DE_METHODS_ALL}.")
     if bad_t:
         raise ValueError(f"unknown track(s) {sorted(bad_t)}; choose from {_DE_TRACKS}.")
 
@@ -579,7 +741,14 @@ def differential_abundance(
 
     label = (qd.proteins["label"] if "label" in qd.proteins.columns
              else qd.proteins.get("gene", pd.Series(qd.proteins.index, index=qd.proteins.index)))
+    if counts is None and "deqms" in methods:
+        if "razor_unique_peptides" not in qd.proteins.columns:
+            raise ValueError("deqms needs a per-protein peptide/PSM count, but "
+                             "qd.proteins has no 'razor_unique_peptides'; pass counts= explicitly.")
+        counts = qd.proteins["razor_unique_peptides"]
     runners = {"limma": lambda M: limma_de(M, qd.groups, ref_group=ref_group, covariates=covariates),
+               "deqms": lambda M: deqms_de(M, qd.groups, counts, ref_group=ref_group,
+                                           covariates=covariates, fit_method=deqms_fit_method),
                "welch": lambda M: welch_de(M, qd.groups, ref_group=ref_group),
                "wilcoxon": lambda M: wilcoxon_de(M, qd.groups, ref_group=ref_group)}
 
