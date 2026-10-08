@@ -67,7 +67,7 @@ class IdsView:
 
         # ── inputs ──
         self.store_path = pn.widgets.TextInput(
-            name="Spectra store (PTERO .zarr — raw/processed — or vendor mzML)",
+            name="Spectra Source (PTERO Dataset or mzML)",
             placeholder=r"C:\data\run.zarr   or   C:\data\run.mzML", width=460)
         self.txt_dir = pn.widgets.TextInput(
             name="MaxQuant txt folder",
@@ -78,7 +78,7 @@ class IdsView:
         self.load_btn = pn.widgets.Button(name="Load identifications", button_type="primary", width=170)
 
         self.status = pn.pane.Markdown(
-            "**No identifications loaded.** Enter a spectra store (PTERO `.zarr` or "
+            "**No identifications loaded.** Enter a spectra source (PTERO Dataset or "
             "mzML) and the MaxQuant `txt` folder, then Load.")
 
         # ── protein table (top, selectable) ──

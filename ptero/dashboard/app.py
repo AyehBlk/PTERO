@@ -72,7 +72,7 @@ class Dashboard:
         self._samples: dict = {}                 # display name -> .zarr path
         self._suspend_sample_watch = False       # guard so populating the selector doesn't auto-open
         self.zarr_path = pn.widgets.TextInput(
-            name="A .zarr store, or a folder of .zarr stores (several paths also OK — one per line / comma-separated)",
+            name="A PTERO Dataset, or a folder of PTERO Datasets (several paths also OK — one per line / comma-separated)",
             placeholder=r"C:\data\run.zarr    — or —    C:\data\stores", width=620)
         self.open_btn = pn.widgets.Button(name="Open", button_type="primary", width=120)
 
@@ -82,7 +82,7 @@ class Dashboard:
             placeholder=r"C:\data\run.d    — or —    C:\data\my_runs    — or —    C:\data\a.d, C:\data\b.d",
             width=620)
         self.conv_outdir = pn.widgets.TextInput(
-            name="Output folder for the .zarr store(s)", placeholder=r"C:\data\stores", width=320)
+            name="PTERO Dataset Output Folder", placeholder=r"C:\data\stores", width=320)
         self.conv_ms = pn.widgets.Select(
             name="MS level", options={"MS1": 1, "MS2": 2, "MS1 + MS2 (both)": None}, value=1, width=150)
         self.conv_frames = pn.widgets.TextInput(
@@ -91,12 +91,12 @@ class Dashboard:
         self.conv_workers = pn.widgets.IntInput(
             name="Parallel workers (many files)", value=2, start=1, end=8, step=1, width=180)
         self.conv_overwrite = pn.widgets.Checkbox(name="Overwrite existing", value=False, width=150)
-        self.conv_btn = pn.widgets.Button(name="Convert → .zarr", button_type="primary", width=160)
+        self.conv_btn = pn.widgets.Button(name="Create PTERO Dataset", button_type="primary", width=160)
 
         # the sample switcher (shown on the View panel only when 2+ samples are loaded)
         self.sample_sel = pn.widgets.Select(name="Sample (view)", options=[], visible=False, width=320)
 
-        self.status = pn.pane.Markdown("**No data loaded.** Open a Zarr store or convert a raw file.")
+        self.status = pn.pane.Markdown("**No data loaded.** Open a PTERO Dataset or convert a raw file.")
 
         # ── view controls ──
         self.ms_sel = pn.widgets.Select(name="MS level", options=["all"], value="all", width=120)
@@ -182,12 +182,12 @@ class Dashboard:
     async def _open(self, event=None):
         spec = self.zarr_path.value.strip()
         if not spec:
-            self.status.object = ("⚠️ Enter a `.zarr` store, or a folder of `.zarr` stores "
+            self.status.object = ("⚠️ Enter a PTERO Dataset, or a folder of PTERO Datasets "
                                   "(several paths also OK, one per line / comma-separated).")
             return
         paths = self._resolve_sample_paths(spec)
         if not paths:
-            self.status.object = f"⚠️ No `.zarr` store found from {spec!r}."
+            self.status.object = f"⚠️ No PTERO Dataset found from {spec!r}."
             return
         names = self._register_samples(paths)
         await self._activate_sample(names[0])
@@ -898,7 +898,7 @@ class Dashboard:
         names = list(self._samples)
         if len(names) < 2:
             self.cmp_panel[:] = [pn.pane.Markdown(
-                "_Load 2+ samples (open a folder of .zarr stores, or several paths) to compare._")]
+                "_Load 2+ samples (open a folder of PTERO Datasets, or several paths) to compare._")]
             return
         self.cmp_panel.loading = True
         try:
@@ -1094,23 +1094,23 @@ class Dashboard:
     # ── layout ─────────────────────────────────────────────────────────────
     def view(self):
         from ._browse import browse_field
-        open_help = ("One .zarr store, or a folder of .zarr stores to load several samples at once "
+        open_help = ("One PTERO Dataset, or a folder of PTERO Datasets to load several samples at once "
                      "(several paths also work — one per line or comma-separated). With 2+ samples, "
                      "switch between them with the Sample selector on the View panel.")
         convert_help = ("One raw file converts to a single store; a folder or several paths convert "
-                        "in parallel, each to its own .zarr. The result(s) load as samples. PTERO "
+                        "in parallel, each to its own PTERO Dataset. The result(s) load as samples. PTERO "
                         "detects profile vs centroid: a .d is already centroid (instrument peak-picked), "
                         "and a single profile mzML is centroided on convert (needs pyopenms). Note: the "
                         "parallel path does not centroid profile mzML yet — convert those one at a time "
                         "for now.")
         open_section = pn.Column(
-            pn.Row(pn.pane.Markdown("## 1 · Open .zarr"),
+            pn.Row(pn.pane.Markdown("## 1 · Open PTERO Dataset"),
                    pn.widgets.TooltipIcon(value=open_help), align="center"),
             pn.Row(browse_field(self.zarr_path, patterns=["*.zarr"], width=620),
                    pn.Column(pn.Spacer(height=18), self.open_btn)),
             sizing_mode="stretch_width")
         convert_section = pn.Column(
-            pn.Row(pn.pane.Markdown("## 2 · Convert to .zarr"),
+            pn.Row(pn.pane.Markdown("## 2 · Create PTERO Dataset"),
                    pn.widgets.TooltipIcon(value=convert_help), align="center"),
             browse_field(self.conv_input, patterns=["*.d", "*.mzML"], width=620),
             pn.Row(self.conv_outdir, self.conv_ms, self.conv_frames, self.conv_batch),
