@@ -25,6 +25,7 @@ combined/
 # R session files
 .Rhistory
 *.Rhistory
+proda_reference_check.R
 
 # OS / editor
 .DS_Store
