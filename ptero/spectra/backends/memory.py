@@ -57,7 +57,10 @@ class MsBackendMemory(MsBackend):
     # ── required interface ───────────────────────────────────────────────
     def __len__(self) -> int:
         return len(self._meta)
-
+    @property
+    def n_peaks(self) -> int:
+        """Return the total number of peaks stored in this backend."""
+        return int(self._offsets[-1])
     def spectra_data(self, columns=None) -> pd.DataFrame:
         df = self._ensure_core_columns(self._meta)
         return df if columns is None else df[list(columns)]

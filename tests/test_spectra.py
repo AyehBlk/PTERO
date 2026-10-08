@@ -222,6 +222,15 @@ class TestBackends:
         for a, b in zip(ref, got):
             np.testing.assert_array_equal(a, b)
 
+    def test_memory_backend_public_spectrum_count(self, sp4d):
+        mem = sp4d.backend
+        assert isinstance(mem, MsBackendMemory)
+        assert len(mem) == 5
+
+    def test_memory_backend_public_peak_count(self, sp4d):
+        mem = sp4d.backend
+        assert isinstance(mem, MsBackendMemory)
+        assert mem.n_peaks == 14
 
 # ── 3D (no ion mobility) ────────────────────────────────────────────────────
 

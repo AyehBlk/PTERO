@@ -526,25 +526,30 @@ class IdsView:
         except Exception as e:
             self.xic_panel[:] = [pn.pane.Markdown(f"_XIC unavailable: {e}_")]
 
-    def _render_info(self, psm, match):
-        pep = psm.peptidoform
-        from .. import ids
-        cov = None
-        if match.resolved and match.spectrum is not None:
-            sp = match.spectrum
-            r = ids._link._match_fragments(
-                np.asarray(sp.mz([0])[0], float), pep.proforma, pep.precursor_charge)
-            cov = f"{r['matched_ions']} ions, coverage {r['coverage']}/{r['max_coverage']}"
-        rows = [
-            f"**Peptide:** `{pep.proforma}`",
-            f"**Charge:** {pep.precursor_charge}",
-            f"**Precursor m/z:** {psm.precursor_mz:.4f}" if psm.precursor_mz else "",
-            f"**RT:** {psm.retention_time:.3f} min" if psm.retention_time is not None else "",
-            f"**1/K0:** {psm.ion_mobility:.4f}" if psm.ion_mobility is not None else "**1/K0:** —",
-            f"**Match method:** `{match.method}` ({match.n_candidates} candidate(s))",
-            f"**Fragments:** {cov}" if cov else "",
-        ]
-        self.info_panel.object = "  \n".join(r for r in rows if r)
+        def _render_info(self, psm, match):
+            pep = psm.peptidoform
+            from .. import ids
+
+            cov = None
+            if match.resolved and match.spectrum is not None:
+                sp = match.spectrum
+                r = ids.match_fragments(
+                    np.asarray(sp.mz([0])[0], float),
+                    pep.proforma,
+                    pep.precursor_charge,
+            )
+                cov = f"{r['matched_ions']} ions, coverage {r['coverage']}/{r['max_coverage']}"
+
+            rows = [
+                f"**Peptide:** `{pep.proforma}`",
+                f"**Charge:** {pep.precursor_charge}",
+                f"**Precursor m/z:** {psm.precursor_mz:.4f}" if psm.precursor_mz else "",
+                f"**RT:** {psm.retention_time:.3f} min" if psm.retention_time is not None else "",
+                f"**1/K0:** {psm.ion_mobility:.4f}" if psm.ion_mobility is not None else "**1/K0:** —",
+                f"**Match method:** `{match.method}` ({match.n_candidates} candidate(s))",
+                f"**Fragments:** {cov}" if cov else "",
+            ]
+            self.info_panel.object = "  \n".join(r for r in rows if r)
 
     # ── layout ─────────────────────────────────────────────────────────────
     def view(self):

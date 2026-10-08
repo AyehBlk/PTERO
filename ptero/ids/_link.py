@@ -264,6 +264,13 @@ def _theoretical_fragments(proforma: str, max_charge: int, ion_types: str = "by"
         out.append((it[0], int(it[1:]), float(mz)))
     return out
 
+def _validate_tol_mode(tol_mode: str) -> None:
+    """Validate the fragment mass-tolerance mode."""
+    if tol_mode not in {"Da", "ppm"}:
+        raise ValueError(
+            f"tol_mode must be 'Da' or 'ppm', got {tol_mode!r}"
+        )
+
 
 def _match_fragments(mz, proforma, precursor_charge,
                      *, fragment_tol=0.02, tol_mode="Da", ion_types="by") -> dict:
@@ -316,6 +323,26 @@ def _match_fragments(mz, proforma, precursor_charge,
     result["coverage"] = len(bonds)
     return result
 
+def match_fragments(mz, peptidoform, precursor_charge):
+    """Summarize theoretical b/y fragment matches for a peptidoform.
+
+    Parameters
+    ----------
+    mz : array-like
+        Observed fragment m/z values.
+    peptidoform
+        Peptidoform whose theoretical fragments are matched.
+    precursor_charge : int
+        Precursor charge used to determine eligible fragment charges.
+
+    Returns
+    -------
+    dict
+        Fragment-match summary containing the same fields as the internal
+        fragment matcher, including ``matched_ions``, ``coverage``, and
+        ``max_coverage``.
+    """
+    return _match_fragments(mz, peptidoform, precursor_charge)
 
 def _fragment_score(mz, intensity, proforma, precursor_mz, precursor_charge,
                     *, fragment_tol=0.02, tol_mode="Da", ion_types="by") -> int:
@@ -350,6 +377,13 @@ def peak_annotations(mz, intensity, proforma, precursor_charge,
     Returns a DataFrame with columns ``mz``, ``intensity``, ``label``,
     ``series``, ``matched`` -- one row per input peak, in input order.
     """
+    _validate_tol_mode(tol_mode)
+
+    if fragment_tol < 0:
+        raise ValueError(
+            f"fragment_tol must be non-negative, got {fragment_tol!r}"
+        )
+
     mz = np.asarray(mz, dtype=float)
     intensity = np.asarray(intensity, dtype=float)
     n = mz.size
@@ -429,17 +463,20 @@ class PsmMatch:
 
 
 def _select_candidates(ms2: pd.DataFrame, rt_sec, mz, im, *, rt_tol, mz_tol, im_tol):
-    """Pure candidate selection -- identical logic to ``tests/test_link.py._match``.
-
-    ``ms2`` is the MS2 rows of ``spectra_data`` (index == store position). Returns
-    ``(candidates_df, used_im)``.
-    """
     cand = ms2[(np.abs(ms2["rtime"] - rt_sec) <= rt_tol)
                & (np.abs(ms2["precursor_mz"] - mz) <= mz_tol)]
     used_im = False
+
     if im is not None and len(cand) > 1:
-        cand = cand[np.abs(cand["ion_mobility"] - im) <= im_tol]
-        used_im = True
+        mobility = cand["ion_mobility"]
+
+        # Mobility can only constrain the match when the candidate spectra
+        # actually contain usable mobility measurements. Missing mobility is
+        # absence of evidence, not evidence against an RT+m/z candidate.
+        if mobility.notna().any():
+            cand = cand[np.abs(mobility - im) <= im_tol]
+            used_im = True
+
     return cand, used_im
 
 
@@ -488,6 +525,25 @@ def spectrum_for_psm(
         ``'fragments'`` ranks remaining candidates by b/y match; ``'none'`` leaves
         an ambiguous result unresolved (``store_index = None``).
     """
+    _validate_tol_mode(tol_mode)
+
+    if disambiguate not in {"fragments", "none"}:
+        raise ValueError(
+            f"disambiguate must be 'fragments' or 'none', got {disambiguate!r}"
+        )
+
+    tolerances = {
+        "rt_tol": rt_tol,
+        "mz_tol": mz_tol,
+        "im_tol": im_tol,
+        "fragment_tol": fragment_tol,
+    }
+    for name, value in tolerances.items():
+        if value < 0:
+            raise ValueError(
+                f"{name} must be non-negative, got {value!r}"
+            )
+
     run = registry.get(psm.run)
     sd = run.spectra_data(["ms_level", "rtime", "precursor_mz", "ion_mobility"])
     ms2 = sd[sd["ms_level"] == 2]
@@ -507,7 +563,7 @@ def spectrum_for_psm(
         idx = int(cand.index[0])
         return PsmMatch(psm, idx, run[idx], cframe, base_method)
 
-    # still ambiguous -> rank by MS2 fragment match
+       # still ambiguous -> rank by MS2 fragment match
     if disambiguate == "fragments" and psm.peptidoform is not None:
         proforma = psm.peptidoform.proforma
         charge = psm.peptidoform.precursor_charge
@@ -519,11 +575,21 @@ def spectrum_for_psm(
             scores.append((pos, _fragment_score(
                 m, it, proforma, mz, charge,
                 fragment_tol=fragment_tol, tol_mode=tol_mode, ion_types=ion_types)))
+
         sframe = (pd.DataFrame(scores, columns=["store_index", "coverage"])
                   .sort_values("coverage", ascending=False, kind="stable")
                   .reset_index(drop=True))
-        best = int(sframe.iloc[0]["store_index"])
-        return PsmMatch(psm, best, run[best], cframe, "fragment-ranked", sframe)
+
+        best_score = int(sframe.iloc[0]["coverage"])
+        second_score = int(sframe.iloc[1]["coverage"])
+
+        if best_score > second_score:
+            best = int(sframe.iloc[0]["store_index"])
+            return PsmMatch(
+                psm, best, run[best], cframe, "fragment-ranked", sframe
+            )
+
+        return PsmMatch(psm, None, None, cframe, "ambiguous", sframe)
 
     return PsmMatch(psm, None, None, cframe, "ambiguous")
 

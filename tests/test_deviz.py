@@ -242,3 +242,66 @@ def test_save_boxplots_filename_safe(tmp_path):
     assert len(paths) == 1
     assert not any(c in paths[0].name for c in ';|/\\')
     assert paths[0].exists()
+
+
+# ── highlight + imputed-mask + plot_imputation ───────────────────────────────
+
+def test_volcano_highlight():
+    d = _de()
+    fig = volcano(d, highlight=d.index[0])
+    assert isinstance(fig, Figure)
+
+
+def test_heatmap_highlight():
+    M, de = _mat_de()
+    fig = heatmap_top(de, M, G3, top=10, ref_group="WT", highlight=de.index[0])
+    assert isinstance(fig, Figure)
+
+
+def test_boxplot_imputed_mask_marks_points():
+    from ptero.quant import plot_de_boxplot
+    M, de = _mat_de()
+    # mark two samples of p0 as imputed
+    mask = pd.Series(False, index=M.columns)
+    mask[[A3[0], B3[0]]] = True
+    fig = plot_de_boxplot(M, "p0", G3, de=de, ref_group="WT", imputed_mask=mask)
+    assert isinstance(fig, Figure)
+    # legend (observed/imputed) is drawn only when imputed points exist
+    assert fig.axes[0].get_legend() is not None
+
+
+def test_plot_imputation_runs():
+    import numpy as np
+    from ptero.quant import (QuantData, classify_missingness, plot_imputation)
+    A = [f"A{i}" for i in range(5)]
+    B = [f"B{i}" for i in range(5)]
+    rng = np.random.default_rng(0)
+    rows = {}
+    for j in range(300):
+        L = rng.uniform(12, 26)
+        p = 0.15 + 0.85 / (1 + np.exp(-(L - 18)))
+        rows[f"bg{j}"] = {c: (2.0 ** (L + rng.normal(0, 0.2)) if rng.random() < p else 0.0)
+                          for c in A + B}
+    lfq = pd.DataFrame(rows).T.replace(0.0, np.nan)
+    lfq.index.name = "id"
+    prot = pd.DataFrame({"gene": lfq.index, "label": lfq.index}, index=lfq.index)
+    qd = QuantData(lfq=lfq, intensity=lfq.copy(),
+                   id_type=pd.DataFrame(index=lfq.index, columns=A + B, dtype=object),
+                   proteins=prot, samples=A + B,
+                   groups={**{c: "PS" for c in A}, **{c: "WT" for c in B}}, source="syn")
+    diag = classify_missingness(qd, on_min=4)
+    assert isinstance(plot_imputation(qd, diag), Figure)
+
+def test_volcano_rejects_invalid_p_values():
+    d = _de()
+    d.loc[d.index[0], "p"] = -0.1
+
+    with pytest.raises(ValueError, match="p-value"):
+        volcano(d)
+
+def test_volcano_rejects_invalid_adjusted_p_values():
+    d = _de()
+    d.loc[d.index[0], "padj"] = 1.1
+
+    with pytest.raises(ValueError, match="adjusted p-value"):
+        volcano(d)

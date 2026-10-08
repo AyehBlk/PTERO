@@ -32,10 +32,13 @@ class AppState:
         A psm_utils ``PSMList`` loaded on the ID page, or ``None``.
     psm_run
         The run id (``PSM.run``) registered for ``id_store``, or ``None``.
+    quant
+        A ``QuantData`` loaded on the differential-expression page, or ``None``.
     """
 
     def __init__(self) -> None:
         self.raw_store = None
+        self.quant = None            # QuantData loaded on the differential-expression page, or None
         self.id_store = None
         self.psms = None
         self.psm_run: Optional[str] = None

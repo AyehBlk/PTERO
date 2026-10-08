@@ -242,11 +242,13 @@ def read_search_modifications(summary_path) -> dict:
           "variable_labels": [label, ...],
         }
 
-    Only fixed mods whose target is a single residue letter are placed in
-    ``"fixed"`` (an N-/C-terminal fixed mod, if ever present, is reported in
-    ``fixed_labels`` but not added per-residue here). A fixed-mod *name* not in
-    the known mass table raises :class:`UnknownModificationError`, because a
-    silently dropped fixed mod yields wrong fragment masses.
+    Only fixed modifications whose target is a single residue letter are
+    currently supported. Fixed modifications with terminal or other non-residue
+    targets raise :class:`ValueError` rather than being silently omitted, because
+    omitting a fixed modification would yield incorrect fragment masses.
+
+    A fixed-modification *name* not present in the known mass table raises
+    :class:`UnknownModificationError`.
 
     Parameters
     ----------
@@ -293,8 +295,11 @@ def read_search_modifications(summary_path) -> dict:
             )
         if residue and len(residue) == 1 and residue.isalpha():
             fixed[residue] = _MOD_NAME_MASS[name]
-        # else: terminal/other-target fixed mod -> reported in fixed_labels only
-
+        else:
+            raise ValueError(
+                f"fixed modification {label!r} has unsupported target {residue!r}; "
+                "only single-residue fixed modifications are currently supported"
+            )
     return {
         "fixed": fixed,
         "variable": variable_labels,

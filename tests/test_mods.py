@@ -182,3 +182,12 @@ def test_explicit_fixed_mods_override_summary(tmp_path):
     n = convert_psm_modifications(psms, fixed_mods={}, summary_path=str(summ))
     assert psms[0].peptidoform.proforma == "PEPCK/2"
     assert n == 0
+
+def test_read_search_modifications_unsupported_fixed_target_raises(tmp_path):
+    from ptero.ids import read_search_modifications
+
+    p = tmp_path / "summary.txt"
+    _write_summary(p, "", "Acetyl (Protein N-term)")
+
+    with pytest.raises(ValueError, match="unsupported target"):
+        read_search_modifications(p)

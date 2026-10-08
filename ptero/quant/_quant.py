@@ -212,8 +212,20 @@ def read_sample_names(protein_groups_path, *, quantity: str = "lfq") -> list[str
     mapping before the full :func:`load_quant`.
     """
     header = _read_header(Path(protein_groups_path))
-    prefix = _LFQ_PREFIX if quantity == "lfq" else _INT_PREFIX
-    cols = [c for c in header if c.lower().startswith(prefix.lower())]
+
+    if quantity == "lfq":
+        prefix = _LFQ_PREFIX
+    elif quantity == "intensity":
+        prefix = _INT_PREFIX
+    else:
+        raise ValueError(
+            f"quantity must be 'lfq' or 'intensity', got {quantity!r}."
+        )
+
+    cols = [
+        c for c in header
+        if c.lower().startswith(prefix.lower())
+    ]
     return [_strip_prefix(c, prefix) for c in cols]
 
 
@@ -294,40 +306,61 @@ def load_quant(
     path = Path(protein_groups_path)
     header = _read_header(path)
 
-    lfq_cols = [c for c in header if c.lower().startswith(_LFQ_PREFIX.lower())]
-    int_cols = [c for c in header
-                if c.lower().startswith(_INT_PREFIX.lower())
-                and not c.lower().startswith(_LFQ_PREFIX.lower())]
-    idtype_cols = [c for c in header if c.lower().startswith(_IDTYPE_PREFIX.lower())]
+    lfq_cols = [
+        c for c in header
+        if c.lower().startswith(_LFQ_PREFIX.lower())
+    ]
+    int_cols = [
+        c for c in header
+        if c.lower().startswith(_INT_PREFIX.lower())
+        and not c.lower().startswith(_LFQ_PREFIX.lower())
+    ]
+    idtype_cols = [
+        c for c in header
+        if c.lower().startswith(_IDTYPE_PREFIX.lower())
+    ]
+
     if "id" not in header:
-        raise ValueError(f"{path.name} has no 'id' column; cannot index protein groups.")
+        raise ValueError(
+            f"{path.name} has no 'id' column; cannot index protein groups."
+        )
 
     lfq_samples = [_strip_prefix(c, _LFQ_PREFIX) for c in lfq_cols]
     int_samples = [_strip_prefix(c, _INT_PREFIX) for c in int_cols]
 
-    # choose the quantification matrix: LFQ (default) or raw Intensity (fallback
-    # for searches run without LFQ). With quantity='intensity', `lfq` holds raw
-    # Intensity (NOT MaxLFQ-normalised) and the LFQ-vs-Intensity cell-state split
-    # collapses; everything else is identical.
     if quantity == "lfq":
         if not lfq_cols:
-            extra = (" Raw 'Intensity' columns are present -- pass "
-                     "quantity='intensity' to use them.") if int_cols else ""
+            extra = (
+                " Raw 'Intensity' columns are present -- pass "
+                "quantity='intensity' to use them."
+            ) if int_cols else ""
             raise ValueError(
                 f"{path.name} has no 'LFQ intensity <sample>' columns -- was LFQ "
-                f"enabled in this MaxQuant search?{extra} Columns: {header[:20]}...")
+                f"enabled in this MaxQuant search?{extra} "
+                f"Columns: {header[:20]}..."
+            )
         main_cols, main_samples = lfq_cols, lfq_samples
+
     elif quantity == "intensity":
         if not int_cols:
             raise ValueError(
                 f"{path.name} has no 'Intensity <sample>' columns. "
-                f"Columns: {header[:20]}...")
+                f"Columns: {header[:20]}..."
+            )
         main_cols, main_samples = int_cols, int_samples
+
     else:
-        raise ValueError(f"quantity must be 'lfq' or 'intensity', got {quantity!r}.")
+        raise ValueError(
+            f"quantity must be 'lfq' or 'intensity', got {quantity!r}."
+        )
 
     samples = main_samples
-    if quantity == "lfq" and int_cols and set(int_samples) != set(lfq_samples):
+
+    if (
+        quantity == "lfq"
+        and int_cols
+        and set(int_samples) != set(lfq_samples)
+    ):
         only_lfq = sorted(set(lfq_samples) - set(int_samples))
         only_int = sorted(set(int_samples) - set(lfq_samples))
         warnings.warn(
@@ -339,15 +372,673 @@ def load_quant(
 
     meta_present = [c for c in _META_COLS if c in header]
     flag_present = [c for c in _FLAG_COLS if c in header]
-    usecols = ["id"] + meta_present + flag_present + lfq_cols + int_cols + idtype_cols
+
+    usecols = (
+        ["id"]
+        + meta_present
+        + flag_present
+        + lfq_cols
+        + int_cols
+        + idtype_cols
+    )
+
     seen: set[str] = set()
-    usecols = [c for c in usecols if not (c in seen or seen.add(c))]
+    usecols = [
+        c for c in usecols
+        if not (c in seen or seen.add(c))
+    ]
 
     df = pd.read_csv(
-        path, sep=SEP, usecols=usecols, encoding=ENC,
-        dtype=str, keep_default_na=False, na_filter=False,
+        path,
+        sep=SEP,
+        usecols=usecols,
+        encoding=ENC,
+        dtype=str,
+        keep_default_na=False,
+        na_filter=False,
     )
     n_raw = int(df.shape[0])
+
+    def _flag(col: str) -> pd.Series:
+        if col not in df.columns:
+            return pd.Series(False, index=df.index)
+        return df[col].astype(str).str.strip() == "+"
+
+    rev = _flag("Reverse")
+    con = _flag("Potential contaminant")
+    site = _flag("Only identified by site")
+
+    n_filtered = {
+        "reverse": int(rev.sum()),
+        "potential_contaminant": int(con.sum()),
+        "only_identified_by_site": int(site.sum()),
+    }
+
+    if drop_decoys_contaminants:
+        keep = ~(rev | con | site)
+        n_filtered["rows_dropped"] = int((~keep).sum())
+        df = df[keep].reset_index(drop=True)
+    else:
+        n_filtered["rows_dropped"] = 0
+
+    # Drop rows whose 'id' is blank or non-numeric (for example, a truncated
+    # final line), but never silently coerce a numeric non-integer identifier.
+    numeric_ids = pd.to_numeric(df["id"], errors="coerce")
+    id_ok = numeric_ids.notna()
+
+    if not id_ok.all():
+        warnings.warn(
+            f"dropped {int((~id_ok).sum())} row(s) with a blank/non-integer "
+            f"'id' (likely a truncated line).",
+            stacklevel=2,
+        )
+        df = df[id_ok].reset_index(drop=True)
+        numeric_ids = numeric_ids[id_ok].reset_index(drop=True)
+
+    noninteger = numeric_ids != np.floor(numeric_ids)
+    if noninteger.any():
+        bad = df.loc[noninteger, "id"].tolist()
+        raise ValueError(
+            "non-integer protein-group id(s) found: "
+            f"{bad[:10]}"
+        )
+
+    ids = numeric_ids.astype("int64")
+
+    if ids.duplicated().any():
+        raise ValueError(
+            "duplicate protein-group ids found; "
+            "protein-group ids must be unique."
+        )
+
+    idx = ids.to_numpy()
+
+    def _matrix(cols: list[str], names: list[str]) -> pd.DataFrame:
+        m = df[cols].apply(pd.to_numeric, errors="coerce")
+
+        if (m < 0).any().any():
+            raise ValueError(
+                "quantification values must be non-negative; "
+                "negative intensity value(s) found."
+            )
+
+        m.columns = names
+        m.index = idx
+        m.index.name = "id"
+        return m.replace(0, np.nan)
+
+    lfq = _matrix(main_cols, main_samples)
+
+    if int_cols:
+        intensity = _matrix(
+            int_cols,
+            int_samples,
+        ).reindex(columns=samples)
+    else:
+        intensity = pd.DataFrame(index=idx)
+        intensity.index.name = "id"
+
+    if idtype_cols:
+        it = df[idtype_cols].apply(
+            lambda c: c.map(_norm_idtype)
+        )
+        it.columns = [
+            _strip_prefix(c, _IDTYPE_PREFIX)
+            for c in idtype_cols
+        ]
+        it.index = idx
+        it.index.name = "id"
+        it = it.reindex(columns=samples)
+        id_type = it.astype(object).where(
+            pd.notna(it),
+            None,
+        )
+        id_type.index.name = "id"
+    else:
+        id_type = pd.DataFrame(
+            index=idx,
+            columns=samples,
+            dtype=object,
+        )
+        id_type = id_type.where(
+            pd.notna(id_type),
+            None,
+        )
+        id_type.index.name = "id"
+
+    proteins = pd.DataFrame(index=idx)
+    proteins.index.name = "id"
+
+    if "Protein IDs" in df:
+        proteins["protein_ids"] = df["Protein IDs"].to_numpy()
+
+    maj = (
+        df["Majority protein IDs"].to_numpy()
+        if "Majority protein IDs" in df
+        else np.array([None] * len(df), dtype=object)
+    )
+
+    if "Majority protein IDs" in df:
+        proteins["majority_protein_ids"] = maj
+
+    genes = (
+        [_parse_gene(x) for x in df["Fasta headers"]]
+        if "Fasta headers" in df
+        else [None] * len(df)
+    )
+
+    proteins["gene"] = pd.Series(
+        genes,
+        index=idx,
+        dtype=object,
+    )
+
+    proteins["label"] = [
+        _label_for(g, m, i)
+        for g, m, i in zip(genes, maj, idx)
+    ]
+
+    if "Species" in df:
+        proteins["species"] = df["Species"].to_numpy()
+
+    if "Q-value" in df:
+        proteins["q_value"] = pd.to_numeric(
+            df["Q-value"],
+            errors="coerce",
+        ).to_numpy()
+
+    if "Score" in df:
+        proteins["score"] = pd.to_numeric(
+            df["Score"],
+            errors="coerce",
+        ).to_numpy()
+
+    if "Razor + unique peptides" in df:
+        proteins["razor_unique_peptides"] = pd.to_numeric(
+            df["Razor + unique peptides"],
+            errors="coerce",
+        ).to_numpy()
+
+    proteins["is_reverse"] = _flag("Reverse").to_numpy()
+    proteins["is_potential_contaminant"] = _flag(
+        "Potential contaminant"
+    ).to_numpy()
+    proteins["is_only_by_site"] = _flag(
+        "Only identified by site"
+    ).to_numpy()
+
+    if groups is not None:
+        groups = dict(groups)
+
+        unknown = [
+            s for s in groups
+            if s not in samples
+        ]
+        unmapped = [
+            s for s in samples
+            if s not in groups
+        ]
+
+        if unknown:
+            raise ValueError(
+                f"groups references samples not in the data: {unknown}. "
+                f"Data samples: {samples}"
+            )
+
+        if unmapped:
+            raise ValueError(
+                f"these samples have no group assigned: {unmapped}. "
+                f"Map every sample, or pass groups=None for ungrouped."
+            )
+
+        groups = {
+            s: groups[s]
+            for s in samples
+        }
+    else:
+        groups = {}
+
+    mq_version = (
+        _read_mq_version(parameters_path)
+        if parameters_path
+        else None
+    )
+
+    return QuantData(
+        lfq=lfq,
+        intensity=intensity,
+        id_type=id_type,
+        proteins=proteins,
+        samples=list(samples),
+        groups=groups,
+        source=path,
+        mq_version=mq_version,
+        n_protein_groups_raw=n_raw,
+        n_filtered=n_filtered,
+    )
+
+    def _flag(col: str) -> pd.Series:
+        if col not in df.columns:
+            return pd.Series(False, index=df.index)
+        return df[col].astype(str).str.strip() == "+"
+
+    rev = _flag("Reverse")
+    con = _flag("Potential contaminant")
+    site = _flag("Only identified by site")
+
+    n_filtered = {
+        "reverse": int(rev.sum()),
+        "potential_contaminant": int(con.sum()),
+        "only_identified_by_site": int(site.sum()),
+    }
+
+    if drop_decoys_contaminants:
+        keep = ~(rev | con | site)
+        n_filtered["rows_dropped"] = int((~keep).sum())
+        df = df[keep].reset_index(drop=True)
+    else:
+        n_filtered["rows_dropped"] = 0
+
+    # guard: drop rows whose 'id' isn't a valid integer (e.g. a truncated final
+    # line in the export). Warn rather than fail the whole load or drop silently.
+    id_ok = pd.to_numeric(df["id"], errors="coerce").notna()
+    if not id_ok.all():
+        warnings.warn(
+            f"dropped {int((~id_ok).sum())} row(s) with a blank/non-integer "
+            f"'id' (likely a truncated line).",
+            stacklevel=2,
+        )
+        df = df[id_ok].reset_index(drop=True)
+
+    ids = pd.to_numeric(df["id"], errors="raise").astype("int64")
+
+    if ids.duplicated().any():
+        raise ValueError(
+            "duplicate protein-group ids found; "
+            "protein-group ids must be unique."
+        )
+
+    idx = ids.to_numpy()
+
+    def _matrix(cols: list[str], names: list[str]) -> pd.DataFrame:
+        m = df[cols].apply(pd.to_numeric, errors="coerce")
+
+        if (m < 0).any().any():
+            raise ValueError(
+                "quantification values must be non-negative; "
+                "negative intensity value(s) found."
+            )
+
+        m.columns = names
+        m.index = idx
+        m.index.name = "id"
+        return m.replace(0, np.nan)
+
+    lfq = _matrix(main_cols, main_samples)
+
+    if int_cols:
+        intensity = _matrix(
+            int_cols,
+            int_samples,
+        ).reindex(columns=samples)
+    else:
+        intensity = pd.DataFrame(index=idx)
+        intensity.index.name = "id"
+
+    if idtype_cols:
+        it = df[idtype_cols].apply(
+            lambda c: c.map(_norm_idtype)
+        )
+        it.columns = [
+            _strip_prefix(c, _IDTYPE_PREFIX)
+            for c in idtype_cols
+        ]
+        it.index = idx
+        it.index.name = "id"
+        it = it.reindex(columns=samples)
+        id_type = it.astype(object).where(
+            pd.notna(it),
+            None,
+        )
+        id_type.index.name = "id"
+    else:
+        id_type = pd.DataFrame(
+            index=idx,
+            columns=samples,
+            dtype=object,
+        )
+        id_type = id_type.where(
+            pd.notna(id_type),
+            None,
+        )
+        id_type.index.name = "id"
+
+    proteins = pd.DataFrame(index=idx)
+    proteins.index.name = "id"
+
+    if "Protein IDs" in df:
+        proteins["protein_ids"] = df["Protein IDs"].to_numpy()
+
+    maj = (
+        df["Majority protein IDs"].to_numpy()
+        if "Majority protein IDs" in df
+        else np.array([None] * len(df), dtype=object)
+    )
+
+    if "Majority protein IDs" in df:
+        proteins["majority_protein_ids"] = maj
+
+    genes = (
+        [_parse_gene(x) for x in df["Fasta headers"]]
+        if "Fasta headers" in df
+        else [None] * len(df)
+    )
+
+    proteins["gene"] = pd.Series(
+        genes,
+        index=idx,
+        dtype=object,
+    )
+
+    proteins["label"] = [
+        _label_for(g, m, i)
+        for g, m, i in zip(genes, maj, idx)
+    ]
+
+    if "Species" in df:
+        proteins["species"] = df["Species"].to_numpy()
+
+    if "Q-value" in df:
+        proteins["q_value"] = pd.to_numeric(
+            df["Q-value"],
+            errors="coerce",
+        ).to_numpy()
+
+    if "Score" in df:
+        proteins["score"] = pd.to_numeric(
+            df["Score"],
+            errors="coerce",
+        ).to_numpy()
+
+    if "Razor + unique peptides" in df:
+        proteins["razor_unique_peptides"] = pd.to_numeric(
+            df["Razor + unique peptides"],
+            errors="coerce",
+        ).to_numpy()
+
+    # carry the MaxQuant flags (recomputed on the kept rows) so downstream can
+    # annotate / retain contaminants (e.g. a transgene spiked into the cRAP db)
+    # without re-reading the file. All False when drop_decoys_contaminants=True.
+    proteins["is_reverse"] = _flag("Reverse").to_numpy()
+    proteins["is_potential_contaminant"] = _flag(
+        "Potential contaminant"
+    ).to_numpy()
+    proteins["is_only_by_site"] = _flag(
+        "Only identified by site"
+    ).to_numpy()
+
+    # groups: explicit, validated, loud
+    if groups is not None:
+        groups = dict(groups)
+
+        unknown = [
+            s for s in groups
+            if s not in samples
+        ]
+        unmapped = [
+            s for s in samples
+            if s not in groups
+        ]
+
+        if unknown:
+            raise ValueError(
+                f"groups references samples not in the data: {unknown}. "
+                f"Data samples: {samples}"
+            )
+
+        if unmapped:
+            raise ValueError(
+                f"these samples have no group assigned: {unmapped}. "
+                f"Map every sample, or pass groups=None for ungrouped."
+            )
+
+        groups = {
+            s: groups[s]
+            for s in samples
+        }
+    else:
+        groups = {}
+
+    mq_version = (
+        _read_mq_version(parameters_path)
+        if parameters_path
+        else None
+    )
+
+    return QuantData(
+        lfq=lfq,
+        intensity=intensity,
+        id_type=id_type,
+        proteins=proteins,
+        samples=list(samples),
+        groups=groups,
+        source=path,
+        mq_version=mq_version,
+        n_protein_groups_raw=n_raw,
+        n_filtered=n_filtered,
+    )
+
+    def _flag(col: str) -> pd.Series:
+        if col not in df.columns:
+            return pd.Series(False, index=df.index)
+        return df[col].astype(str).str.strip() == "+"
+
+    rev = _flag("Reverse")
+    con = _flag("Potential contaminant")
+    site = _flag("Only identified by site")
+
+    n_filtered = {
+        "reverse": int(rev.sum()),
+        "potential_contaminant": int(con.sum()),
+        "only_identified_by_site": int(site.sum()),
+    }
+
+    if drop_decoys_contaminants:
+        keep = ~(rev | con | site)
+        n_filtered["rows_dropped"] = int((~keep).sum())
+        df = df[keep].reset_index(drop=True)
+    else:
+        n_filtered["rows_dropped"] = 0
+
+    # guard: drop rows whose 'id' isn't a valid integer (e.g. a truncated final
+    # line in the export). Warn rather than fail the whole load or drop silently.
+    id_ok = pd.to_numeric(df["id"], errors="coerce").notna()
+    if not id_ok.all():
+        warnings.warn(
+            f"dropped {int((~id_ok).sum())} row(s) with a blank/non-integer "
+            f"'id' (likely a truncated line).",
+            stacklevel=2,
+        )
+        df = df[id_ok].reset_index(drop=True)
+
+    ids = pd.to_numeric(df["id"], errors="raise").astype("int64")
+
+    if ids.duplicated().any():
+        warnings.warn(
+            "duplicate protein-group ids found; matrices will have a "
+            "non-unique index.",
+            stacklevel=2,
+        )
+
+    idx = ids.to_numpy()
+
+    def _matrix(cols: list[str], names: list[str]) -> pd.DataFrame:
+        m = df[cols].apply(pd.to_numeric, errors="coerce")
+
+        if (m < 0).any().any():
+            raise ValueError(
+                "quantification values must be non-negative; "
+                "negative intensity value(s) found."
+            )
+
+        m.columns = names
+        m.index = idx
+        m.index.name = "id"
+        return m.replace(0, np.nan)
+
+    lfq = _matrix(main_cols, main_samples)
+
+    if int_cols:
+        intensity = _matrix(
+            int_cols,
+            int_samples,
+        ).reindex(columns=samples)
+    else:
+        intensity = pd.DataFrame(index=idx)
+        intensity.index.name = "id"
+
+    if idtype_cols:
+        it = df[idtype_cols].apply(
+            lambda c: c.map(_norm_idtype)
+        )
+        it.columns = [
+            _strip_prefix(c, _IDTYPE_PREFIX)
+            for c in idtype_cols
+        ]
+        it.index = idx
+        it.index.name = "id"
+        it = it.reindex(columns=samples)
+        id_type = it.astype(object).where(
+            pd.notna(it),
+            None,
+        )
+        id_type.index.name = "id"
+    else:
+        id_type = pd.DataFrame(
+            index=idx,
+            columns=samples,
+            dtype=object,
+        )
+        id_type = id_type.where(
+            pd.notna(id_type),
+            None,
+        )
+        id_type.index.name = "id"
+
+    proteins = pd.DataFrame(index=idx)
+    proteins.index.name = "id"
+
+    if "Protein IDs" in df:
+        proteins["protein_ids"] = df["Protein IDs"].to_numpy()
+
+    maj = (
+        df["Majority protein IDs"].to_numpy()
+        if "Majority protein IDs" in df
+        else np.array([None] * len(df), dtype=object)
+    )
+
+    if "Majority protein IDs" in df:
+        proteins["majority_protein_ids"] = maj
+
+    genes = (
+        [_parse_gene(x) for x in df["Fasta headers"]]
+        if "Fasta headers" in df
+        else [None] * len(df)
+    )
+
+    proteins["gene"] = pd.Series(
+        genes,
+        index=idx,
+        dtype=object,
+    )
+
+    proteins["label"] = [
+        _label_for(g, m, i)
+        for g, m, i in zip(genes, maj, idx)
+    ]
+
+    if "Species" in df:
+        proteins["species"] = df["Species"].to_numpy()
+
+    if "Q-value" in df:
+        proteins["q_value"] = pd.to_numeric(
+            df["Q-value"],
+            errors="coerce",
+        ).to_numpy()
+
+    if "Score" in df:
+        proteins["score"] = pd.to_numeric(
+            df["Score"],
+            errors="coerce",
+        ).to_numpy()
+
+    if "Razor + unique peptides" in df:
+        proteins["razor_unique_peptides"] = pd.to_numeric(
+            df["Razor + unique peptides"],
+            errors="coerce",
+        ).to_numpy()
+
+    # carry the MaxQuant flags (recomputed on the kept rows) so downstream can
+    # annotate / retain contaminants (e.g. a transgene spiked into the cRAP db)
+    # without re-reading the file. All False when drop_decoys_contaminants=True.
+    proteins["is_reverse"] = _flag("Reverse").to_numpy()
+    proteins["is_potential_contaminant"] = _flag(
+        "Potential contaminant"
+    ).to_numpy()
+    proteins["is_only_by_site"] = _flag(
+        "Only identified by site"
+    ).to_numpy()
+
+    # groups: explicit, validated, loud
+    if groups is not None:
+        groups = dict(groups)
+
+        unknown = [
+            s for s in groups
+            if s not in samples
+        ]
+        unmapped = [
+            s for s in samples
+            if s not in groups
+        ]
+
+        if unknown:
+            raise ValueError(
+                f"groups references samples not in the data: {unknown}. "
+                f"Data samples: {samples}"
+            )
+
+        if unmapped:
+            raise ValueError(
+                f"these samples have no group assigned: {unmapped}. "
+                f"Map every sample, or pass groups=None for ungrouped."
+            )
+
+        groups = {
+            s: groups[s]
+            for s in samples
+        }
+    else:
+        groups = {}
+
+    mq_version = (
+        _read_mq_version(parameters_path)
+        if parameters_path
+        else None
+    )
+
+    return QuantData(
+        lfq=lfq,
+        intensity=intensity,
+        id_type=id_type,
+        proteins=proteins,
+        samples=list(samples),
+        groups=groups,
+        source=path,
+        mq_version=mq_version,
+        n_protein_groups_raw=n_raw,
+        n_filtered=n_filtered,
+    )
 
     def _flag(col: str) -> pd.Series:
         if col not in df.columns:

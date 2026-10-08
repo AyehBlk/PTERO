@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.patches import Rectangle
 
 from ._plots import _style_axes
 
@@ -56,6 +57,7 @@ def volcano(
     lfc_thresh: float = 1.0,
     label_top: int = 10,
     labels=None,
+    highlight=None,
     title: Optional[str] = None,
     figsize=(8.8, 7.2),
 ) -> Figure:
@@ -82,11 +84,24 @@ def volcano(
     """
     if "log2FC" not in de.columns or "p" not in de.columns:
         raise ValueError("volcano needs 'log2FC' and 'p' columns.")
+
     d = de.reset_index(drop=False)
     lfc = d["log2FC"].to_numpy(dtype=float)
     p = d["p"].to_numpy(dtype=float)
+
+    invalid_p = np.isinf(p) | ((p < 0) | (p > 1))
+    if invalid_p.any():
+        raise ValueError(
+            "p-value(s) must be within [0, 1] or NaN."
+        )
+
     if "padj" in d.columns:
         padj = d["padj"].to_numpy(dtype=float)
+        invalid_padj = np.isinf(padj) | ((padj < 0) | (padj > 1))
+        if invalid_padj.any():
+            raise ValueError(
+                "adjusted p-value(s) must be within [0, 1] or NaN."
+            )
     else:
         from ._de import _bh
         padj = _bh(p)
@@ -100,6 +115,7 @@ def volcano(
 
     with np.errstate(divide="ignore"):
         y = -np.log10(np.clip(p, 1e-300, 1.0))
+
     sig = (padj < alpha) & (np.abs(lfc) >= lfc_thresh)
     up = sig & (lfc > 0)
     down = sig & (lfc < 0)
@@ -110,29 +126,56 @@ def volcano(
     fig = Figure(figsize=figsize, layout="constrained")
     ax = fig.add_subplot(111)
 
-    ax.scatter(lfc[ns], y[ns], s=10, c=_NS, alpha=0.5, linewidths=0, zorder=1)
-    ax.scatter(lfc[down], y[down], s=36, c=_DOWN, alpha=0.9,
-               edgecolor="white", linewidths=0.3, zorder=3)
-    ax.scatter(lfc[up], y[up], s=36, c=_UP, alpha=0.9,
-               edgecolor="white", linewidths=0.3, zorder=3)
+    ax.scatter(
+        lfc[ns], y[ns], s=10, c=_NS, alpha=0.5,
+        linewidths=0, zorder=1,
+    )
+    ax.scatter(
+        lfc[down], y[down], s=36, c=_DOWN, alpha=0.9,
+        edgecolor="white", linewidths=0.3, zorder=3,
+    )
+    ax.scatter(
+        lfc[up], y[up], s=36, c=_UP, alpha=0.9,
+        edgecolor="white", linewidths=0.3, zorder=3,
+    )
 
     # guides: zero, +/- lfc threshold, BH p threshold
     ax.axvline(0, color=_ZERO, lw=0.8, zorder=0)
     if lfc_thresh > 0:
         for xg in (-lfc_thresh, lfc_thresh):
-            ax.axvline(xg, color=_GUIDE, ls="--", lw=0.9, zorder=0)
+            ax.axvline(
+                xg, color=_GUIDE, ls="--", lw=0.9, zorder=0
+            )
 
-    xmax = float(np.nanmax(np.abs(lfc))) * 1.15 if lfc.size else 1.0
+    xmax = (
+        float(np.nanmax(np.abs(lfc))) * 1.15
+        if lfc.size
+        else 1.0
+    )
     ax.set_xlim(-xmax, xmax)
-    ymax = float(np.nanmax(y)) * 1.12 if y.size and np.isfinite(y).any() else 1.0
+
+    ymax = (
+        float(np.nanmax(y)) * 1.12
+        if y.size and np.isfinite(y).any()
+        else 1.0
+    )
 
     passed = p[padj < alpha]
     if passed.size:
         pthr = float(passed.max())
         yln = -np.log10(pthr)
-        ax.axhline(yln, color=_GUIDE, ls=":", lw=1.0, zorder=0)
-        ax.text(xmax, yln, f"BH {alpha:g} ", va="bottom", ha="right",
-                fontsize=7, color=_GUIDE)
+        ax.axhline(
+            yln, color=_GUIDE, ls=":", lw=1.0, zorder=0
+        )
+        ax.text(
+            xmax,
+            yln,
+            f"BH {alpha:g} ",
+            va="bottom",
+            ha="right",
+            fontsize=7,
+            color=_GUIDE,
+        )
 
     # on/off candidates are shown separately (detection_matrix), not here
     ax.set_ylim(0, ymax)
@@ -142,41 +185,125 @@ def volcano(
     order = list(np.argsort(p))
     picked = [i for i in order if sig[i]][:label_top]
     if len(picked) < label_top:
-        picked += [i for i in order if i not in picked][:label_top - len(picked)]
+        picked += [
+            i for i in order
+            if i not in picked
+        ][:label_top - len(picked)]
+
     placed = []
     xr, yr = 2 * xmax, max(ymax, 1e-9)
     for i in picked:
         xi, yi = lfc[i], y[i]
-        if any(abs(xi - px) < 0.055 * xr and abs(yi - py) < 0.045 * yr for px, py in placed):
+        if any(
+            abs(xi - px) < 0.055 * xr
+            and abs(yi - py) < 0.045 * yr
+            for px, py in placed
+        ):
             continue
-        placed.append((xi, yi))
-        ax.annotate(_short_label(lab[i]), (xi, yi),
-                    xytext=(3 if xi >= 0 else -3, 3), textcoords="offset points",
-                    ha="left" if xi >= 0 else "right", va="bottom",
-                    fontsize=7, color="#333333")
 
-    xlab = (f"log2 fold change    (<- {down_lab}   |   {up_lab} ->)"
-            if up_grp else "log2 fold change")
+        placed.append((xi, yi))
+        ax.annotate(
+            _short_label(lab[i]),
+            (xi, yi),
+            xytext=(3 if xi >= 0 else -3, 3),
+            textcoords="offset points",
+            ha="left" if xi >= 0 else "right",
+            va="bottom",
+            fontsize=7,
+            color="#333333",
+        )
+
+    if highlight is not None:
+        hids = (
+            highlight
+            if isinstance(highlight, (list, tuple, set))
+            else [highlight]
+        )
+        for hid in hids:
+            if hid in de.index:
+                hx = float(de.loc[hid, "log2FC"])
+                hy = -np.log10(
+                    max(float(de.loc[hid, "p"]), 1e-300)
+                )
+                ax.scatter(
+                    [hx],
+                    [hy],
+                    s=180,
+                    facecolor="none",
+                    edgecolor="#111827",
+                    linewidths=2.0,
+                    zorder=6,
+                )
+                hl = _short_label(
+                    de.loc[hid, "label"]
+                    if "label" in de.columns
+                    else hid
+                )
+                ax.annotate(
+                    hl,
+                    (hx, hy),
+                    xytext=(4, 4),
+                    textcoords="offset points",
+                    fontsize=8,
+                    fontweight="bold",
+                    color="#111827",
+                    zorder=6,
+                )
+
+    xlab = (
+        f"log2 fold change    (<- {down_lab}   |   {up_lab} ->)"
+        if up_grp
+        else "log2 fold change"
+    )
     ax.set_xlabel(xlab)
     ax.set_ylabel("-log10 p")
+
     method = de.attrs.get("method", "")
     contrast = de.attrs.get("contrast", "")
-    ax.set_title(title or f"Volcano  {contrast}" + (f"  ({method})" if method else ""))
+    ax.set_title(
+        title
+        or f"Volcano  {contrast}"
+        + (f"  ({method})" if method else "")
+    )
+
     _style_axes(ax)
 
-    handles = [Line2D([0], [0], marker="o", ls="", color=_UP, label=up_lab),
-               Line2D([0], [0], marker="o", ls="", color=_DOWN, label=down_lab),
-               Line2D([0], [0], marker="o", ls="", color=_NS, label="not significant")]
-    ax.legend(handles=handles, fontsize=7.5, frameon=False, loc="upper left",
-              bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
+    handles = [
+        Line2D(
+            [0], [0], marker="o", ls="",
+            color=_UP, label=up_lab,
+        ),
+        Line2D(
+            [0], [0], marker="o", ls="",
+            color=_DOWN, label=down_lab,
+        ),
+        Line2D(
+            [0], [0], marker="o", ls="",
+            color=_NS, label="not significant",
+        ),
+    ]
+    ax.legend(
+        handles=handles,
+        fontsize=7.5,
+        frameon=False,
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        borderaxespad=0.0,
+    )
 
-    ax.text(0.99, 0.01,
-            f"{int(up.sum())} up / {int(down.sum())} down "
-            f"(padj<{alpha:g}, |log2FC|>={lfc_thresh:g})",
-            transform=ax.transAxes, ha="right", va="bottom",
-            fontsize=7.5, color="#555555")
+    ax.text(
+        0.99,
+        0.01,
+        f"{int(up.sum())} up / {int(down.sum())} down "
+        f"(padj<{alpha:g}, |log2FC|>={lfc_thresh:g})",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=7.5,
+        color="#555555",
+    )
+
     return fig
-
 
 def detection_matrix(
     qd,
@@ -350,6 +477,7 @@ def heatmap_top(
     ref_group=None,
     zscore: bool = True,
     cmap: str = "RdBu_r",
+    highlight=None,
     title=None,
     figsize=None,
 ) -> Figure:
@@ -436,6 +564,11 @@ def heatmap_top(
         sp.set_visible(False)
     ax.set_title(title or f"Top {n} differential proteins  ({left} vs {right})", fontsize=12)
 
+    if highlight is not None and highlight in ids:
+        r = ids.index(highlight)
+        ax.add_patch(Rectangle((-0.5, r - 0.5), m, 1, fill=False,
+                               edgecolor="#111827", lw=2.2, zorder=6))
+
     cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
     cb.set_label("row z-score" if zscore else "log2 intensity", fontsize=8)
     cb.ax.tick_params(labelsize=7)
@@ -450,11 +583,15 @@ def plot_de_boxplot(
     de: pd.DataFrame = None,
     label=None,
     ref_group=None,
+    imputed_mask=None,
     seed: int = 0,
     title=None,
     figsize=(5.2, 5.0),
 ) -> Figure:
     """Grouped intensity box + points for one protein, with the DE stats annotated.
+
+    ``imputed_mask`` (per-sample bool, indexable by sample name) draws imputed
+    values as hollow rings so you can see how much of a protein was imputed.
 
     One box per group (distribution across that group's samples) with the individual
     sample values jittered on top, coloured by group (matching the volcano). If a DE
@@ -468,18 +605,21 @@ def plot_de_boxplot(
     if not ref_group and len(order) == 2:
         color = {order[0]: _DOWN, order[1]: _UP}
 
+    def _imp(s):
+        return bool(imputed_mask[s]) if (imputed_mask is not None and s in imputed_mask) else False
+
     row = matrix.loc[protein_id]
-    vals = {g: [] for g in order}
+    pts = {g: [] for g in order}                      # group -> [(value, is_imputed)]
     for s in matrix.columns:
         g = groups.get(s)
         v = row[s]
-        if g in vals and np.isfinite(v):
-            vals[g].append(float(v))
+        if g in pts and np.isfinite(v):
+            pts[g].append((float(v), _imp(s)))
 
     rng = np.random.default_rng(seed)
     fig = Figure(figsize=figsize, layout="constrained")
     ax = fig.add_subplot(111)
-    data = [vals[g] for g in order]
+    data = [[v for v, _ in pts[g]] for g in order]
     bp = ax.boxplot(data, positions=range(len(order)), widths=0.5, patch_artist=True,
                     showfliers=False, medianprops=dict(color="#333333", linewidth=1.4),
                     whiskerprops=dict(color="#999999", linewidth=1.0),
@@ -488,15 +628,32 @@ def plot_de_boxplot(
     for patch, g in zip(bp["boxes"], order):
         patch.set_facecolor(color[g])
         patch.set_alpha(0.22)
+    any_imp = False
     for i, g in enumerate(order):
-        ys = vals[g]
+        ys = [v for v, _ in pts[g]]
+        ims = [im for _, im in pts[g]]
         xs = rng.normal(i, 0.055, len(ys))
-        ax.scatter(xs, ys, color=color[g], s=46, zorder=3, edgecolor="white", linewidths=0.7)
+        obs = [k for k, im in enumerate(ims) if not im]
+        imp = [k for k, im in enumerate(ims) if im]
+        if obs:
+            ax.scatter([xs[k] for k in obs], [ys[k] for k in obs], color=color[g],
+                       s=46, zorder=3, edgecolor="white", linewidths=0.7)
+        if imp:
+            any_imp = True
+            ax.scatter([xs[k] for k in imp], [ys[k] for k in imp], facecolor="white",
+                       edgecolor=color[g], s=54, linewidths=1.7, zorder=4)
 
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels(order)
     ax.set_ylabel("normalized log2 intensity")
     _style_axes(ax)
+    if any_imp:
+        ax.legend(handles=[
+            Line2D([0], [0], marker="o", ls="", markerfacecolor="#888888",
+                   markeredgecolor="white", label="observed"),
+            Line2D([0], [0], marker="o", ls="", markerfacecolor="white",
+                   markeredgecolor="#888888", label="imputed")],
+            fontsize=8, frameon=False, loc="best")
 
     name = label
     if name is None and de is not None and "label" in de.columns and protein_id in de.index:
@@ -588,3 +745,48 @@ def save_de_boxplots(
         fig.savefig(path, dpi=dpi, bbox_inches="tight")
         written.append(path)
     return written
+
+
+def plot_imputation(qd, diag, *, normalization: str = "median", seed: int = 1,
+                    figsize=(8.6, 4.6)) -> Figure:
+    """Observed vs imputed value distributions for the imputable proteins.
+
+    Overlays the observed normalized log2 intensities against the values the two
+    imputation strategies would fill in (mechanism-routed QRILC+kNN, and MinProb
+    downshift), so the effect of imputation on the data is visible before choosing
+    a track. Imputed values should sit in the low tail; MinProb is more aggressive.
+    """
+    from ._impute import impute_matrix
+    from ._missing import log2_median_normalize
+
+    M = log2_median_normalize(qd.lfq, method=normalization)
+    imp_mech, miss = impute_matrix(qd, diag, method="mechanism",
+                                   normalization=normalization, seed=seed)
+    imp_mp, _ = impute_matrix(qd, diag, method="minprob",
+                              normalization=normalization, seed=seed)
+    obs = M.to_numpy(dtype=float)
+    obs = obs[~np.isnan(obs)]
+    mask = miss.to_numpy()
+    mech_v = imp_mech.to_numpy(dtype=float)[mask]
+    mp_v = imp_mp.to_numpy(dtype=float)[mask]
+
+    lo = float(np.nanmin([obs.min(), mech_v.min() if mech_v.size else obs.min(),
+                          mp_v.min() if mp_v.size else obs.min()]))
+    hi = float(obs.max())
+    bins = np.linspace(lo, hi, 60)
+
+    fig = Figure(figsize=figsize, layout="constrained")
+    ax = fig.add_subplot(111)
+    ax.hist(obs, bins, density=True, color="#cccccc", alpha=0.7, label="observed", zorder=1)
+    if mech_v.size:
+        ax.hist(mech_v, bins, density=True, histtype="step", color="#1f4e79", linewidth=1.9,
+                label="imputed (mechanism)", zorder=3)
+    if mp_v.size:
+        ax.hist(mp_v, bins, density=True, histtype="step", color="#d97706", linewidth=1.9,
+                label="imputed (MinProb)", zorder=2)
+    ax.set_xlabel("normalized log2 intensity")
+    ax.set_ylabel("density")
+    ax.set_title("Observed vs imputed values")
+    _style_axes(ax)
+    ax.legend(fontsize=8, frameon=False, loc="upper left")
+    return fig

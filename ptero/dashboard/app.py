@@ -1149,11 +1149,13 @@ def build_app():
     """
     from ._state import AppState
     from .ids_view import IdsView
+    from .de_view import DeView
 
     state = AppState()
 
     raw_page = build_raw_page()
     ids_page = IdsView(state).view()
+    de_page = DeView(state).view()
 
     template = pn.template.FastListTemplate(
         title="PTERO",
@@ -1161,6 +1163,7 @@ def build_app():
         main=[pn.Tabs(
             ("Raw data", raw_page),
             ("Identifications", ids_page),
+            ("Differential expression", de_page),
         )],
     )
     return template

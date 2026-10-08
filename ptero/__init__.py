@@ -5,7 +5,7 @@ __version__ = "0.2.0"
 
 # Subpackages load on first access, so `import ptero` stays light and never
 # fails when an optional dependency (panel, anndata, psm_utils, …) is absent.
-_SUBPACKAGES = {"spectra", "ids", "quant", "dashboard"}
+_SUBPACKAGES = {"spectra", "process", "ids", "quant", "dashboard"}
 
 def __getattr__(name):
     if name in _SUBPACKAGES:

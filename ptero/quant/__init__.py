@@ -55,7 +55,8 @@ from ._de import (
 )
 from ._impute import impute_matrix, impute_minprob, impute_qrilc
 from ._deviz import (detection_matrix, heatmap_top, plot_de_boxplot,
-                     save_de_boxplots, volcano)
+                     plot_imputation, save_de_boxplots, volcano)
+from ._proda import proda_de, proda_version, r_available
 
 __all__ = [
     # core
@@ -97,6 +98,10 @@ __all__ = [
     "detection_matrix",
     "heatmap_top",
     "plot_de_boxplot",
+    "plot_imputation",
+    "proda_de",
+    "r_available",
+    "proda_version",
     "save_de_boxplots",
     "MECHANISM_ORDER",
     "DIAGNOSE_COLORS",

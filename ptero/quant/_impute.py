@@ -66,8 +66,13 @@ def impute_qrilc(M: pd.DataFrame, *, tune_sigma: float = 1.0, seed: int = 1) -> 
         if nm == 0:
             continue
         obs = col[~miss]
+        if obs.size == 0:
+            raise ValueError(
+            f"sample {M.columns[j]!r} has no observed values; "
+            "QRILC imputation is undefined"
+            )
         if obs.size < 3:
-            X[miss, j] = np.nanmin(col) if obs.size else float(np.nanmin(X))
+            X[miss, j] = np.nanmin(col)
             continue
         pNA = nm / n
         full_p = pNA + u * (1.0 - pNA)
@@ -103,6 +108,11 @@ def impute_minprob(M: pd.DataFrame, *, width: float = 0.3, downshift: float = 1.
         if nm == 0:
             continue
         obs = col[~miss]
+        if obs.size == 0:
+            raise ValueError(
+            f"sample {M.columns[j]!r} has no observed values; "
+            "MinProb imputation is undefined"
+            )
         mu, sd = float(np.mean(obs)), float(np.std(obs) or 1.0)
         X[miss, j] = rng.normal(mu - downshift * sd, max(width * sd, 1e-9), size=nm)
     return pd.DataFrame(X, index=M.index, columns=M.columns)

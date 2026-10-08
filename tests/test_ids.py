@@ -157,6 +157,20 @@ def test_spectrum_for_psm_mobility_disambiguates():
     m_b = ids.spectrum_for_psm(_psm(im=1.15), reg)
     assert m_b.store_index == idx_b
 
+def test_spectrum_for_psm_missing_store_mobility_does_not_discard_candidates():
+    store = _two_precursor_store(im_a=np.nan, im_b=np.nan)
+    reg = ids.RunRegistry()
+    reg.register("synth", store)
+
+    m = ids.spectrum_for_psm(
+        _psm(im=0.90),
+        reg,
+        disambiguate="none",
+    )
+    assert not m.resolved
+    assert m.method == "ambiguous"
+    assert m.store_index is None
+    assert m.n_candidates == 2
 
 def test_spectrum_for_psm_ambiguous_without_mobility():
     store = _two_precursor_store()
@@ -188,6 +202,35 @@ def test_spectrum_for_psm_fragment_ranks_when_mobility_absent():
     assert int(top["coverage"]) == len("PEPTIDEK") - 1
     assert int(m.fragment_scores.iloc[-1]["coverage"]) < int(top["coverage"])
 
+def test_spectrum_for_psm_fragment_tie_stays_ambiguous():
+    # Both candidates contain exactly the same fragment evidence, so fragment
+    # ranking has no scientific basis for choosing one over the other.
+    peaks = _by_ions("PEPTIDEK")
+    store = _two_precursor_store(
+        im_a=0.90,
+        im_b=0.90,
+        peaks_a=peaks,
+        peaks_b=peaks,
+    )
+    reg = ids.RunRegistry()
+    reg.register("synth", store)
+
+    m = ids.spectrum_for_psm(
+        _psm(im=None),
+        reg,
+        disambiguate="fragments",
+    )
+
+    assert not m.resolved
+    assert m.method == "ambiguous"
+    assert m.store_index is None
+    assert m.spectrum is None
+    assert m.n_candidates == 2
+    assert m.fragment_scores is not None
+    assert len(m.fragment_scores) == 2
+    assert int(m.fragment_scores.iloc[0]["coverage"]) == int(
+        m.fragment_scores.iloc[1]["coverage"]
+    )
 
 def test_annotate_match_produces_annotations():
     peaks_a = _by_ions("PEPTIDEK")
@@ -207,3 +250,94 @@ def test_annotate_match_unresolved_raises():
     m = ids.spectrum_for_psm(_psm(im=None), reg, disambiguate="none")
     with pytest.raises(ValueError):
         ids.annotate_match(m)
+
+def test_spectrum_for_psm_invalid_tol_mode_raises():
+    peaks_a = _by_ions("PEPTIDEK")
+    peaks_b = np.random.RandomState(4).uniform(100, 900, len(peaks_a))
+    store = _two_precursor_store(
+        im_a=0.90,
+        im_b=0.90,
+        peaks_a=peaks_a,
+        peaks_b=peaks_b,
+    )
+    reg = ids.RunRegistry()
+    reg.register("synth", store)
+
+    with pytest.raises(ValueError, match="tol_mode"):
+        ids.spectrum_for_psm(
+            _psm(im=None),
+            reg,
+            disambiguate="fragments",
+            tol_mode="pmm",  # typo: must not silently become Da
+        )
+
+def test_peak_annotations_invalid_tol_mode_raises():
+    mz = np.array([100.0, 200.0, 300.0])
+    intensity = np.array([10.0, 20.0, 30.0])
+
+    with pytest.raises(ValueError, match="tol_mode"):
+        ids.peak_annotations(
+            mz,
+            intensity,
+            "PEPTIDEK",
+            2,
+            tol_mode="pmm",
+        )
+
+def test_spectrum_for_psm_invalid_disambiguate_raises():
+    store = _two_precursor_store(im_a=0.90, im_b=0.90)
+    reg = ids.RunRegistry()
+    reg.register("synth", store)
+
+    with pytest.raises(ValueError, match="disambiguate"):
+        ids.spectrum_for_psm(
+            _psm(im=None),
+            reg,
+            disambiguate="fragment",  # typo
+        )
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("rt_tol", -1.0),
+        ("mz_tol", -0.1),
+        ("im_tol", -0.01),
+        ("fragment_tol", -0.01),
+    ],
+)
+def test_spectrum_for_psm_negative_tolerance_raises(name, value):
+    store = _two_precursor_store(im_a=0.90, im_b=0.90)
+    reg = ids.RunRegistry()
+    reg.register("synth", store)
+
+    kwargs = {name: value}
+
+    with pytest.raises(ValueError, match=name):
+        ids.spectrum_for_psm(
+            _psm(im=None),
+            reg,
+            **kwargs,
+        )
+
+def test_peak_annotations_negative_fragment_tol_raises():
+    mz = np.array([100.0, 200.0, 300.0])
+    intensity = np.array([10.0, 20.0, 30.0])
+
+    with pytest.raises(ValueError, match="fragment_tol"):
+        ids.peak_annotations(
+            mz,
+            intensity,
+            "PEPTIDEK",
+            2,
+            fragment_tol=-0.01,
+        )
+
+def test_read_search_modifications_rejects_unsupported_terminal_fixed_mod(tmp_path):
+    _write_tsv(
+        tmp_path / "summary.txt",
+        ["Fixed modifications", "Variable modifications"],
+        [["Acetyl (Protein N-term)", "Oxidation (M)"]],
+    )
+
+    with pytest.raises(ValueError, match="fixed modification"):
+        ids.read_search_modifications(tmp_path / "summary.txt")

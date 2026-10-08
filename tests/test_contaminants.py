@@ -51,3 +51,22 @@ def test_custom_patterns():
 def test_missing_gene_is_ok():
     p = _prot([None, "Myh4"])
     assert annotate_contaminants(p)["contaminant_class"].tolist() == ["ok", "muscle"]
+
+def test_crap_accession_marker_must_be_prefix():
+    p = _prot(
+        ["Gene1", "Gene2", "Gene3"],
+        protein_ids=["CON__P1", "cRAP_P2", "SCRAP1"],
+    )
+
+    out = annotate_contaminants(p)
+
+    assert out["contaminant_class"].tolist() == [
+        "cRAP",
+        "cRAP",
+        "ok",
+    ]
+    assert out["is_crap"].tolist() == [
+        True,
+        True,
+        False,
+    ]

@@ -20,6 +20,7 @@ from ._store import (
     PROCESSING_PROVENANCE_ATTR,
 )
 from ._centroiding import make_centroid_transform
+from ._transforms import FunctionTransform, SpectrumTransform
 
 __all__ = [
     "process_store",
@@ -30,4 +31,6 @@ __all__ = [
     "PROCESSED_SCHEMA_VERSION",
     "PROCESSED_FLAG_ATTR",
     "PROCESSING_PROVENANCE_ATTR",
+    "FunctionTransform",
+    "SpectrumTransform",
 ]

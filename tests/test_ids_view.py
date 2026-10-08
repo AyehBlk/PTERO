@@ -217,3 +217,11 @@ def test_mod_sites_empty_when_none(tmp_path):
     ms = ModificationSites(str(tmp_path))   # no *Sites.txt present
     assert len(ms) == 0
     assert ms.for_group("anything") == []
+
+def test_ids_view_does_not_depend_on_private_ids_link():
+    from pathlib import Path
+    import ptero.dashboard.ids_view as ids_view
+
+    source = Path(ids_view.__file__).read_text(encoding="utf-8")
+
+    assert "ids._link" not in source

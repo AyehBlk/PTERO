@@ -23,7 +23,7 @@ from ..spectra._bruker import (
     _open_timstof, _read_timstof_frames, _timstof_n_frames, from_timstof_dataframe,
 )
 from ..spectra.backends.memory import MsBackendMemory
-from ..spectra.backends.zarr_backend import _ZarrStreamWriter
+from ..spectra.backends.zarr_backend import ZarrStreamWriter
 
 
 def _is_bruker_d(path: str) -> bool:
@@ -121,7 +121,7 @@ def _convert_bruker(path, out, ms_level, frames, frame_batch, _log) -> str:
     _log(f"reading {label} in batches of {frame_batch} frames"
          + (f" over frames {start}..{stop}" if stop is not None else " (walking to end of run)"))
 
-    writer = _ZarrStreamWriter(out, has_4d=True,
+    writer = ZarrStreamWriter(out, has_4d=True,
                                acquisition_mode=(acq_mode if acq_mode == "dda" else "unknown"))
     f = start
     n_spec = n_peaks = 0
@@ -136,10 +136,10 @@ def _convert_bruker(path, out, ms_level, frames, frame_batch, _log) -> str:
             empty_streak = 0
             mem = from_timstof_dataframe(df, ms_level=None).backend
             writer.append_backend(mem)
-            n_spec += len(mem._meta)
-            n_peaks += int(mem._offsets[-1])
+            n_spec += len(mem)
+            n_peaks += mem.n_peaks
             pct = f" [{min(e - start, total)}/{total} frames]" if total else ""
-            _log(f"frames {f}-{e}: +{len(mem._meta)} spectra"
+            _log(f"frames {f}-{e}: +{len(mem)} spectra"
                  f" ({n_peaks:,} peaks total){pct}")
         else:
             empty_streak += 1
@@ -187,7 +187,7 @@ def _convert_bruker_dia(data, path, out, ms_level, frames, frame_batch, n_frames
     stop = int(frames[1]) if frames is not None else n_frames
     total = (stop - start) if stop is not None else None
 
-    writer = _ZarrStreamWriter(out, has_4d=True, acquisition_mode="dia")
+    writer = ZarrStreamWriter(out, has_4d=True, acquisition_mode="dia")
     f = start
     n_spec = n_peaks = n_unassigned = 0
     enriched = False                          # add 1/K0 window bounds once
@@ -215,10 +215,10 @@ def _convert_bruker_dia(data, path, out, ms_level, frames, frame_batch, n_frames
                     warnings.simplefilter("ignore")       # per-batch drop notice; we log a total
                     mem = from_timstof_dataframe(df).backend
                 writer.append_backend(mem)
-                n_spec += len(mem._meta)
-                n_peaks += int(mem._offsets[-1])
+                n_spec += len(mem)
+                n_peaks += mem.n_peaks
                 pct = f" [{min(e - start, total)}/{total} frames]" if total else ""
-                _log(f"frames {f}-{e}: +{len(mem._meta)} spectra ({n_peaks:,} peaks total){pct}")
+                _log(f"frames {f}-{e}: +{len(mem)} spectra ({n_peaks:,} peaks total){pct}")
         else:
             empty_streak += 1
             if stop is None and empty_streak >= 2:
@@ -253,7 +253,7 @@ def _convert_mzml(path, out, ms_level, spectrum_batch, _log, transform=None) -> 
          + (" (4D)" if has_4d else " (3D)")
          + (" with inline transform" if transform is not None else ""))
 
-    writer = _ZarrStreamWriter(out, has_4d=has_4d)
+    writer = ZarrStreamWriter(out, has_4d=has_4d)
     for s in range(0, n, spectrum_batch):
         ee = min(s + spectrum_batch, n)
         peaks = sp.peaks_data(indices=list(range(s, ee)), columns=cols)

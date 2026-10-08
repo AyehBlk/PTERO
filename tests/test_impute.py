@@ -148,3 +148,22 @@ def test_requires_two_groups():
     qd.groups = {c: "ALL" for c in A + B}
     with pytest.raises(ValueError, match="2 groups"):
         impute_matrix(qd, diag)
+
+def test_minprob_rejects_all_missing_sample():
+    M = pd.DataFrame({
+        "A": [20.0, 21.0, 22.0],
+        "B": [np.nan, np.nan, np.nan],
+    })
+
+    with pytest.raises(ValueError, match="no observed values"):
+        impute_minprob(M)
+
+
+def test_qrilc_rejects_all_missing_sample():
+    M = pd.DataFrame({
+        "A": [20.0, 21.0, 22.0],
+        "B": [np.nan, np.nan, np.nan],
+    })
+
+    with pytest.raises(ValueError, match="no observed values"):
+        impute_qrilc(M)

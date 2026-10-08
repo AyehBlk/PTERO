@@ -99,6 +99,13 @@ def test_pseudocount_when_min_count_zero():
     assert not deq["p"].isna().any()
     assert (deq["count"] >= 1).all()          # pseudocount applied
 
+def test_negative_count_rejected():
+    M, counts = _matrix_counts(n_prot=500)
+    counts.iloc[0] = -1
+
+    with pytest.raises(ValueError, match="non-negative"):
+        deqms_de(M, GROUPS, counts, ref_group="WT")
+
 
 def test_requires_complete_matrix():
     M, counts = _matrix_counts(n_prot=200)
@@ -112,3 +119,31 @@ def test_fit_methods_run():
     for fm in ("loess", "spline", "nls"):
         deq = deqms_de(M, GROUPS, counts, ref_group="WT", fit_method=fm)
         assert not deq["p"].isna().any(), fm
+
+def test_deqms_rejects_zero_residual_df():
+    M, counts = _matrix_counts(n_prot=200)
+    M = M.loc[:, [A[0], B[0]]]
+    groups = {
+        A[0]: "PS",
+        B[0]: "WT",
+    }
+
+    with pytest.raises(ValueError, match="residual degrees of freedom"):
+        deqms_de(M, groups, counts, ref_group="WT")
+
+def test_deqms_rejects_infinite_values():
+    M, counts = _matrix_counts(n_prot=200)
+    M.iloc[0, 0] = np.inf
+
+    with pytest.raises(ValueError, match="finite"):
+        deqms_de(M, GROUPS, counts, ref_group="WT")
+
+def test_infinite_count_rejected():
+    M, counts = _matrix_counts(n_prot=500)
+
+    # Convert to float so the test can represent a non-finite count.
+    counts = counts.astype(float)
+    counts.iloc[0] = np.inf
+
+    with pytest.raises(ValueError, match="finite"):
+        deqms_de(M, GROUPS, counts, ref_group="WT")

@@ -39,7 +39,7 @@ KERATIN = (r"^Krt\d", r"^Krtap", r"^Krt[0-9]")
 BLOOD = (r"^Hba", r"^Hbb", r"^Hbq", r"^Alb$")
 
 # accession substrings that mark a database contaminant when no flag is present
-_CRAP_ACCESSION = re.compile(r"CON__|cRAP", re.IGNORECASE)
+_CRAP_ACCESSION = re.compile(r"^(?:CON__|cRAP)", re.IGNORECASE)
 
 
 def _combined(patterns) -> str:

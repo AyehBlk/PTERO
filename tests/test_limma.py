@@ -12,7 +12,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ptero.quant import QuantData, complete_case_matrix, limma_de
+from ptero.quant import (
+    QuantData,
+    complete_case_matrix,
+    limma_de,
+    welch_de,
+    wilcoxon_de,
+)
 from ptero.quant._de import _fit_fdist, _squeeze_var, _trigamma_inverse
 
 A = [f"A{i}" for i in range(5)]   # PS19
@@ -170,3 +176,62 @@ def test_welch_wilcoxon_need_complete_matrix():
         welch_de(M, GROUPS, ref_group="WT")
     with pytest.raises(ValueError, match="complete matrix"):
         wilcoxon_de(M, GROUPS, ref_group="WT")
+
+def test_confounded_covariate_rejected():
+    M = _de_matrix(n_prot=200, n_de=20, shift=1.0, seed=7)
+
+    # Perfect confounding: covariate level is determined entirely by group.
+    covariates = {
+        **{s: "batch1" for s in A},
+        **{s: "batch2" for s in B},
+    }
+
+    with pytest.raises(ValueError, match="full rank"):
+        limma_de(
+            M,
+            GROUPS,
+            ref_group="WT",
+            covariates=covariates,
+        )
+
+def test_limma_rejects_zero_residual_df():
+    M = _de_matrix(n_prot=200).loc[:, [A[0], B[0]]]
+    groups = {
+        A[0]: "PS19",
+        B[0]: "WT",
+    }
+
+    with pytest.raises(ValueError, match="residual degrees of freedom"):
+        limma_de(M, groups, ref_group="WT")
+
+def test_limma_rejects_infinite_values():
+    M = _de_matrix(n_prot=200)
+    M.iloc[0, 0] = np.inf
+
+    with pytest.raises(ValueError, match="finite"):
+        limma_de(M, GROUPS, ref_group="WT")
+
+def test_welch_rejects_infinite_values():
+    M = _de_matrix(n_prot=200)
+    M.iloc[0, 0] = np.inf
+
+    with pytest.raises(ValueError, match="finite"):
+        welch_de(M, GROUPS, ref_group="WT")
+
+
+def test_wilcoxon_rejects_infinite_values():
+    M = _de_matrix(n_prot=200)
+    M.iloc[0, 0] = np.inf
+
+    with pytest.raises(ValueError, match="finite"):
+        wilcoxon_de(M, GROUPS, ref_group="WT")
+
+def test_welch_rejects_one_sample_per_group():
+    M = _de_matrix(n_prot=200).loc[:, [A[0], B[0]]]
+    groups = {
+        A[0]: "PS19",
+        B[0]: "WT",
+    }
+
+    with pytest.raises(ValueError, match="at least 2 samples"):
+        welch_de(M, groups, ref_group="WT")

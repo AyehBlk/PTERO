@@ -25,6 +25,9 @@ dev = ["pytest>=7.0", "ruff"]
 [tool.setuptools.packages.find]
 include = ["ptero*"]
 
+[tool.setuptools.package-data]
+"ptero.quant" = ["*.R"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"

@@ -7,6 +7,7 @@ from ._link import (
     peak_annotations,
     read_psms,
     spectrum_for_psm,
+    match_fragments,
 )
 from ._mods import (
     UnknownModificationError,
@@ -27,4 +28,5 @@ __all__ = [
     "convert_psm_modifications",
     "read_search_modifications",
     "UnknownModificationError",
+    "match_fragments",
 ]

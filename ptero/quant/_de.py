@@ -349,22 +349,43 @@ def _squeeze_var(s2, df_resid):
 def _design_matrix(samples, groups, ref_group, covariates=None):
     g = {s: groups[s] for s in samples}
     levels = sorted(set(g.values()))
+
     if ref_group not in levels:
-        raise ValueError(f"ref_group {ref_group!r} not among groups {levels}.")
+        raise ValueError(
+            f"ref_group {ref_group!r} not among groups {levels}."
+        )
     if len(levels) != 2:
-        raise ValueError(f"limma_de supports a 2-level group factor; got {levels}.")
+        raise ValueError(
+            f"limma_de supports a 2-level group factor; got {levels}."
+        )
+
     non_ref = next(l for l in levels if l != ref_group)
+
     cols = [np.ones(len(samples))]
     names = ["(Intercept)", f"{non_ref}_vs_{ref_group}"]
-    cols.append(np.array([1.0 if g[s] == non_ref else 0.0 for s in samples]))
+
+    cols.append(
+        np.array([1.0 if g[s] == non_ref else 0.0 for s in samples])
+    )
     coef_index = 1
+
     if covariates:
         cov = {s: str(covariates[s]) for s in samples}
         for lv in sorted(set(cov.values()))[1:]:
-            cols.append(np.array([1.0 if cov[s] == lv else 0.0 for s in samples]))
+            cols.append(
+                np.array([1.0 if cov[s] == lv else 0.0 for s in samples])
+            )
             names.append(f"cov_{lv}")
-    return np.column_stack(cols), coef_index, names[1]
 
+    design = np.column_stack(cols)
+
+    if np.linalg.matrix_rank(design) < design.shape[1]:
+        raise ValueError(
+            "design matrix is not full rank; group and covariate effects "
+            "cannot be estimated independently"
+        )
+
+    return design, coef_index, names[1]
 
 def limma_de(matrix: pd.DataFrame, groups, *, ref_group: str, covariates=None) -> pd.DataFrame:
     """limma moderated t-test for a two-group contrast on a complete matrix.
@@ -392,24 +413,38 @@ def limma_de(matrix: pd.DataFrame, groups, *, ref_group: str, covariates=None) -
 
     samples = list(matrix.columns)
     X, ci, coef_name = _design_matrix(samples, groups, ref_group, covariates)
+
     Y = matrix.to_numpy(dtype=float)
-    if np.isnan(Y).any():
-        raise ValueError("limma_de requires a complete matrix (no NaN); impute or "
-                         "use the complete-case matrix first.")
+    if not np.isfinite(Y).all():
+        raise ValueError(
+            "limma_de requires a complete matrix with finite values "
+            "(no NaN or infinity); impute or use the complete-case matrix first."
+        )
+
     n = X.shape[0]
     XtX_inv = np.linalg.inv(X.T @ X)
-    beta = XtX_inv @ X.T @ Y.T                       # terms x proteins
+    beta = XtX_inv @ X.T @ Y.T
     resid = Y.T - X @ beta
+
     df_resid = n - np.linalg.matrix_rank(X)
+    if df_resid <= 0:
+        raise ValueError(
+            "limma_de requires positive residual degrees of freedom; "
+            "the design has too few samples for the fitted model"
+        )
+
     s2 = np.sum(resid ** 2, axis=0) / df_resid
     stdev_unscaled = float(np.sqrt(XtX_inv[ci, ci]))
     coef = beta[ci, :]
 
     s2_post, s2_0, df0 = _squeeze_var(s2, df_resid)
     se = stdev_unscaled * np.sqrt(s2_post)
+
     with np.errstate(invalid="ignore", divide="ignore"):
         t = coef / se
+
     df_total = df_resid + df0
+
     if np.isinf(df_total):
         p = 2.0 * stats.norm.sf(np.abs(t))
     else:
@@ -423,13 +458,14 @@ def limma_de(matrix: pd.DataFrame, groups, *, ref_group: str, covariates=None) -
     out["p"] = p
     out["padj"] = _bh(p)
     out["df_total"] = df_total
+
     out.attrs["method"] = "limma"
     out.attrs["contrast"] = coef_name
     out.attrs["var_prior"] = s2_0
     out.attrs["df_prior"] = df0
     out.attrs["df_residual"] = df_resid
-    return out
 
+    return out
 
 def complete_case_matrix(qd: "QuantData", diag: pd.DataFrame = None, *,
                          normalization: str = "median", only_ok: bool = True) -> pd.DataFrame:
@@ -470,23 +506,42 @@ def welch_de(matrix: pd.DataFrame, groups, *, ref_group: str) -> pd.DataFrame:
     """Welch's t-test (unequal variance) per protein on a complete matrix."""
     from scipy import stats
 
-    if np.isnan(matrix.to_numpy(dtype=float)).any():
-        raise ValueError("welch_de requires a complete matrix (no NaN).")
+    Y = matrix.to_numpy(dtype=float)
+    if not np.isfinite(Y).all():
+        raise ValueError(
+            "welch_de requires a complete matrix with finite values "
+            "(no NaN or infinity)."
+        )
+
     non_ref, a_cols, b_cols = _two_group_cols(matrix, groups, ref_group)
+
+    if len(a_cols) < 2 or len(b_cols) < 2:
+        raise ValueError(
+            "welch_de requires at least 2 samples in each group."
+        )
+
     Acols = matrix[a_cols].to_numpy(dtype=float)
     Bcols = matrix[b_cols].to_numpy(dtype=float)
-    r = stats.ttest_ind(Acols, Bcols, axis=1, equal_var=False)
+
+    r = stats.ttest_ind(
+        Acols,
+        Bcols,
+        axis=1,
+        equal_var=False,
+    )
+
     out = pd.DataFrame(index=matrix.index)
     out.index.name = matrix.index.name or "id"
     out["log2FC"] = Acols.mean(axis=1) - Bcols.mean(axis=1)
-    out["AveExpr"] = matrix.to_numpy(dtype=float).mean(axis=1)
+    out["AveExpr"] = Y.mean(axis=1)
     out["t"] = r.statistic
     out["p"] = r.pvalue
     out["padj"] = _bh(np.asarray(r.pvalue, dtype=float))
+
     out.attrs["method"] = "welch"
     out.attrs["contrast"] = f"{non_ref}_vs_{ref_group}"
-    return out
 
+    return out
 
 def wilcoxon_de(matrix: pd.DataFrame, groups, *, ref_group: str) -> pd.DataFrame:
     """Mann-Whitney U (rank-sum) per protein on a complete matrix.
@@ -498,23 +553,37 @@ def wilcoxon_de(matrix: pd.DataFrame, groups, *, ref_group: str) -> pd.DataFrame
     """
     from scipy import stats
 
-    if np.isnan(matrix.to_numpy(dtype=float)).any():
-        raise ValueError("wilcoxon_de requires a complete matrix (no NaN).")
+    Y = matrix.to_numpy(dtype=float)
+    if not np.isfinite(Y).all():
+        raise ValueError(
+            "wilcoxon_de requires a complete matrix with finite values "
+            "(no NaN or infinity)."
+        )
+
     non_ref, a_cols, b_cols = _two_group_cols(matrix, groups, ref_group)
+
     Acols = matrix[a_cols].to_numpy(dtype=float)
     Bcols = matrix[b_cols].to_numpy(dtype=float)
-    r = stats.mannwhitneyu(Acols, Bcols, axis=1, alternative="two-sided")
+
+    r = stats.mannwhitneyu(
+        Acols,
+        Bcols,
+        axis=1,
+        alternative="two-sided",
+    )
+
     out = pd.DataFrame(index=matrix.index)
     out.index.name = matrix.index.name or "id"
     out["log2FC"] = Acols.mean(axis=1) - Bcols.mean(axis=1)
-    out["AveExpr"] = matrix.to_numpy(dtype=float).mean(axis=1)
+    out["AveExpr"] = Y.mean(axis=1)
     out["U"] = r.statistic
     out["p"] = r.pvalue
     out["padj"] = _bh(np.asarray(r.pvalue, dtype=float))
+
     out.attrs["method"] = "wilcoxon"
     out.attrs["contrast"] = f"{non_ref}_vs_{ref_group}"
-    return out
 
+    return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dispatcher: run a set of DE methods across the complete-case and imputed tracks.
@@ -578,7 +647,6 @@ def _deqms_prior_df(mean_myfct: float, numgenes: int):
     j = int(np.argmin(priordf))
     return (j + 1) / 10.0
 
-
 def deqms_de(matrix: pd.DataFrame, groups, counts, *, ref_group: str,
              covariates=None, fit_method: str = "loess") -> pd.DataFrame:
     """DEqMS moderated t-test for a two-group contrast on a complete matrix.
@@ -604,62 +672,128 @@ def deqms_de(matrix: pd.DataFrame, groups, counts, *, ref_group: str,
     the prior df, contrast and fit method.
     """
     from scipy import stats
-    from scipy.special import digamma, polygamma      # trigamma(z) = polygamma(1, z)
+    from scipy.special import digamma, polygamma
 
     samples = list(matrix.columns)
     X, ci, coef_name = _design_matrix(samples, groups, ref_group, covariates)
+
     Y = matrix.to_numpy(dtype=float)
-    if np.isnan(Y).any():
-        raise ValueError("deqms_de requires a complete matrix (no NaN); impute or "
-                         "use the complete-case matrix first.")
+    if not np.isfinite(Y).all():
+        raise ValueError(
+            "deqms_de requires a complete matrix with finite values "
+            "(no NaN or infinity); impute or use the complete-case matrix first."
+        )
+
     cnt = pd.Series(counts).reindex(matrix.index).to_numpy(dtype=float)
-    if np.isnan(cnt).any():
-        raise ValueError("counts contain NaN for some proteins in the matrix; "
-                         "provide a peptide/PSM count for every protein.")
+
+    if not np.isfinite(cnt).all():
+        raise ValueError(
+            "counts must contain finite values for every protein in the matrix "
+            "(no NaN or infinity)."
+        )
+
+    if np.any(cnt < 0):
+        raise ValueError(
+            "counts must be non-negative peptide/PSM counts."
+        )
+
     if cnt.min() == 0:
-        cnt = cnt + 1.0                                # DEqMS pseudocount
+        cnt = cnt + 1.0  # DEqMS pseudocount
 
     n = X.shape[0]
     XtX_inv = np.linalg.inv(X.T @ X)
     beta = XtX_inv @ X.T @ Y.T
     resid = Y.T - X @ beta
+
     df = n - np.linalg.matrix_rank(X)
+    if df <= 0:
+        raise ValueError(
+            "deqms_de requires positive residual degrees of freedom; "
+            "the design has too few samples for the fitted model"
+        )
+
     sigma2 = np.sum(resid ** 2, axis=0) / df
     stdev_unscaled = float(np.sqrt(XtX_inv[ci, ci]))
     coef = beta[ci, :]
 
-    # guard exact-zero variance (identical rows) before the log
-    floor = np.nanmin(sigma2[sigma2 > 0]) * 1e-6 if np.any(sigma2 > 0) else 1e-12
+    # Guard exact-zero variance (identical rows) before the log.
+    floor = (
+        np.nanmin(sigma2[sigma2 > 0]) * 1e-6
+        if np.any(sigma2 > 0)
+        else 1e-12
+    )
     logVAR = np.log(np.maximum(sigma2, floor))
 
     if fit_method == "loess":
-        y_pred = _loess_predict(np.log2(cnt), logVAR, span=0.75, degree=2)
+        y_pred = _loess_predict(
+            np.log2(cnt),
+            logVAR,
+            span=0.75,
+            degree=2,
+        )
+
     elif fit_method == "spline":
         from scipy.interpolate import UnivariateSpline
+
         x = np.log2(cnt)
         o = np.argsort(x)
         y_pred = np.empty_like(logVAR)
-        y_pred[o] = UnivariateSpline(x[o], logVAR[o], k=3)(x[o])
+        y_pred[o] = UnivariateSpline(
+            x[o],
+            logVAR[o],
+            k=3,
+        )(x[o])
+
     elif fit_method == "nls":
         from scipy.optimize import curve_fit
-        popt, _ = curve_fit(lambda xx, a, b: a + b / xx, cnt, sigma2,
-                            p0=[0.1, 0.05], maxfev=10000)
-        y_pred = np.log(np.maximum(popt[0] + popt[1] / cnt, floor))
-    else:
-        raise ValueError(f"fit_method must be 'loess' | 'spline' | 'nls', got {fit_method!r}.")
 
-    # Sartor IBMT: prior df from the trend residuals, count-dependent prior variance
+        popt, _ = curve_fit(
+            lambda xx, a, b: a + b / xx,
+            cnt,
+            sigma2,
+            p0=[0.1, 0.05],
+            maxfev=10000,
+        )
+        y_pred = np.log(
+            np.maximum(popt[0] + popt[1] / cnt, floor)
+        )
+
+    else:
+        raise ValueError(
+            f"fit_method must be 'loess' | 'spline' | 'nls', "
+            f"got {fit_method!r}."
+        )
+
+    # Sartor IBMT: prior df from the trend residuals,
+    # count-dependent prior variance.
     eg = logVAR - digamma(df / 2.0) + np.log(df / 2.0)
     egpred = y_pred - digamma(df / 2.0) + np.log(df / 2.0)
-    myfct = (eg - egpred) ** 2 - float(polygamma(1, df / 2.0))
+
+    myfct = (
+        (eg - egpred) ** 2
+        - float(polygamma(1, df / 2.0))
+    )
     mean_myfct = float(np.nanmean(myfct))
-    d0 = _deqms_prior_df(mean_myfct, int(np.isfinite(logVAR).sum()))
-    s2_0 = np.exp(egpred + digamma(d0 / 2.0) - np.log(d0 / 2.0))   # per-protein prior
+
+    d0 = _deqms_prior_df(
+        mean_myfct,
+        int(np.isfinite(logVAR).sum()),
+    )
+
+    s2_0 = np.exp(
+        egpred
+        + digamma(d0 / 2.0)
+        - np.log(d0 / 2.0)
+    )
 
     post_var = (d0 * s2_0 + df * sigma2) / (d0 + df)
     post_df = df + d0
+
     with np.errstate(invalid="ignore", divide="ignore"):
-        t = coef / (stdev_unscaled * np.sqrt(post_var))
+        t = coef / (
+            stdev_unscaled * np.sqrt(post_var)
+        )
+
     p = 2.0 * stats.t.sf(np.abs(t), post_df)
 
     out = pd.DataFrame(index=matrix.index)
@@ -671,13 +805,14 @@ def deqms_de(matrix: pd.DataFrame, groups, counts, *, ref_group: str,
     out["padj"] = _bh(p)
     out["count"] = cnt
     out["df_total"] = post_df
+
     out.attrs["method"] = "deqms"
     out.attrs["contrast"] = coef_name
     out.attrs["df_prior"] = d0
     out.attrs["df_residual"] = df
     out.attrs["fit_method"] = fit_method
-    return out
 
+    return out
 
 _DE_METHODS = ("limma", "welch", "wilcoxon")              # default suite
 _DE_METHODS_ALL = ("limma", "deqms", "welch", "wilcoxon")  # deqms is opt-in (needs counts)

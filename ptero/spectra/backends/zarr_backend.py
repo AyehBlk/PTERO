@@ -1,9 +1,7 @@
 """
 Zarr backend for raw MS data (3D and 4D) -- the chunked, cloud-native store.
 
-This is the piece that does not exist in the Python MS ecosystem yet: a lazy,
-chunked on-disk backend for raw spectra that conforms to a common Spectra-style
-interface, so a 50 GB timsTOF run never has to fit in RAM.
+A lazy, chunked on-disk backend for raw spectra conforming to PTERO's common backend interface. The design supports runs larger than available RAM.
 
 On-disk layout (a ``.zarr`` directory / store)
 -----------------------------------------------
@@ -35,6 +33,12 @@ import numpy as np
 import pandas as pd
 
 from ._base import MsBackend, DEFAULT_PEAKS_VARIABLES
+from .._schema import (
+    ATTR_ACQUISITION_MODE, ATTR_FORMAT_VERSION, ATTR_HAS_4D, ATTR_N_SPECTRA,
+    ATTR_PEAKS_VARIABLES, OFFSETS_ARRAY, PEAKS_GROUP, PEAK_INTENSITY,
+    PEAK_ION_MOBILITY, PEAK_MZ, PTERO_FORMAT_VERSION, SPECTRA_METADATA_FILE,
+    store_attrs,
+)
 
 
 def _require_zarr():
@@ -56,15 +60,16 @@ class MsBackendZarr(MsBackend):
         self.path = str(path)
         self._root = zarr.open_group(self.path, mode="r")
         attrs = dict(self._root.attrs)
-        self.has_4d = bool(attrs.get("has_4d", False))
+        self.format_version = attrs.get(ATTR_FORMAT_VERSION)
+        self.has_4d = bool(attrs.get(ATTR_HAS_4D, False))
         #: "dda" | "dia" | "unknown" -- the acquisition mode recorded at write time
-        self.acquisition_mode = str(attrs.get("acquisition_mode", "unknown"))
-        self._n_total = int(attrs.get("n_spectra", 0))
-        self._offsets = self._root["offsets"][:]  # small (n+1,), cheap to hold
+        self.acquisition_mode = str(attrs.get(ATTR_ACQUISITION_MODE, "unknown"))
+        self._n_total = int(attrs.get(ATTR_N_SPECTRA, 0))
+        self._offsets = self._root[OFFSETS_ARRAY][:]  # small (n+1,), cheap to hold
         # view index (subsetting without rewriting the store)
         self._idx = np.arange(self._n_total, dtype=np.int64) if _idx is None else np.asarray(_idx, np.int64)
         # metadata lives in a Parquet sidecar
-        self._meta_path = Path(self.path) / "spectra.parquet"
+        self._meta_path = Path(self.path) / SPECTRA_METADATA_FILE
 
     # ── writing ──────────────────────────────────────────────────────────
     @classmethod
@@ -81,14 +86,23 @@ class MsBackendZarr(MsBackend):
         offsets = np.asarray(offsets, np.int64)
         has_4d = ion_mobility is not None
 
+        if offsets.ndim != 1 or len(offsets) == 0:
+            raise ValueError("offsets must be a non-empty 1D array")
+        if offsets[0] != 0 or np.any(np.diff(offsets) < 0):
+            raise ValueError("offsets must start at 0 and be monotonically non-decreasing")
+        if int(offsets[-1]) != len(mz) or len(intensity) != len(mz):
+            raise ValueError("offsets[-1], len(mz), and len(intensity) must agree")
+        if has_4d and len(np.asarray(ion_mobility)) != len(mz):
+            raise ValueError("ion_mobility must have one value per peak")
+        if len(meta) != len(offsets) - 1:
+            raise ValueError("metadata must contain one row per spectrum")
+
         root = zarr.open_group(path, mode="w")
-        root.attrs["n_spectra"] = int(len(offsets) - 1)
-        root.attrs["has_4d"] = bool(has_4d)
-        root.attrs["acquisition_mode"] = str(acquisition_mode)
-        root.attrs["peaks_variables"] = list(
-            ("mz", "intensity", "ion_mobility") if has_4d else ("mz", "intensity")
-        )
-        peaks = root.create_group("peaks")
+        root.attrs.update(store_attrs(
+            n_spectra=len(offsets) - 1, has_4d=has_4d,
+            acquisition_mode=acquisition_mode,
+        ))
+        peaks = root.create_group(PEAKS_GROUP)
 
         def _write_array(group, name, data):
             n = max(1, len(data))
@@ -98,11 +112,11 @@ class MsBackendZarr(MsBackend):
             if len(data):
                 arr[:] = data
 
-        _write_array(peaks, "mz", mz)
-        _write_array(peaks, "intensity", intensity)
+        _write_array(peaks, PEAK_MZ, mz)
+        _write_array(peaks, PEAK_INTENSITY, intensity)
         if has_4d:
-            _write_array(peaks, "ion_mobility", np.asarray(ion_mobility, np.float32))
-        off_arr = root.create_array("offsets", shape=(len(offsets),),
+            _write_array(peaks, PEAK_ION_MOBILITY, np.asarray(ion_mobility, np.float32))
+        off_arr = root.create_array(OFFSETS_ARRAY, shape=(len(offsets),),
                                     chunks=(len(offsets),), dtype="i8")
         off_arr[:] = offsets
 
@@ -110,7 +124,7 @@ class MsBackendZarr(MsBackend):
         meta = meta.reset_index(drop=True).copy()
         if "data_storage" not in meta.columns:
             meta["data_storage"] = path
-        meta.to_parquet(Path(path) / "spectra.parquet", index=False)
+        meta.to_parquet(Path(path) / SPECTRA_METADATA_FILE, index=False)
         return cls(path)
 
     # ── required interface ───────────────────────────────────────────────
@@ -209,7 +223,7 @@ class MsBackendZarr(MsBackend):
             i = j + 1
 
 
-class _ZarrStreamWriter:
+class ZarrStreamWriter:
     """Write a Zarr store incrementally, one batch of spectra at a time.
 
     This is the memory-safe path for large runs. Only the *current* batch's
@@ -222,7 +236,7 @@ class _ZarrStreamWriter:
 
     Usage::
 
-        w = _ZarrStreamWriter(path, has_4d=True)
+        w = ZarrStreamWriter(path, has_4d=True)
         for mem in batches:          # each `mem` is an MsBackendMemory
             w.append_backend(mem)
         backend = w.finalize()
@@ -237,10 +251,10 @@ class _ZarrStreamWriter:
         self.has_4d = bool(has_4d)
         self.acquisition_mode = str(acquisition_mode)
         self._root = zarr.open_group(self.path, mode="w")
-        peaks = self._root.create_group("peaks")
-        self._mz = peaks.create_array("mz", shape=(0,), chunks=(chunk_size,), dtype="f8")
-        self._int = peaks.create_array("intensity", shape=(0,), chunks=(chunk_size,), dtype="f4")
-        self._im = (peaks.create_array("ion_mobility", shape=(0,), chunks=(chunk_size,), dtype="f4")
+        peaks = self._root.create_group(PEAKS_GROUP)
+        self._mz = peaks.create_array(PEAK_MZ, shape=(0,), chunks=(chunk_size,), dtype="f8")
+        self._int = peaks.create_array(PEAK_INTENSITY, shape=(0,), chunks=(chunk_size,), dtype="f4")
+        self._im = (peaks.create_array(PEAK_ION_MOBILITY, shape=(0,), chunks=(chunk_size,), dtype="f4")
                     if self.has_4d else None)
         self._offsets = [0]        # CSR index-pointer (small: one int per spectrum)
         self._meta_parts = []      # list of metadata DataFrames (small)
@@ -271,19 +285,21 @@ class _ZarrStreamWriter:
     def finalize(self) -> "MsBackendZarr":
         """Write offsets, attributes, and the metadata sidecar; return the backend."""
         offsets = np.asarray(self._offsets, np.int64)
-        off_arr = self._root.create_array("offsets", shape=(len(offsets),),
+        off_arr = self._root.create_array(OFFSETS_ARRAY, shape=(len(offsets),),
                                           chunks=(len(offsets),), dtype="i8")
         off_arr[:] = offsets
-        self._root.attrs["n_spectra"] = int(len(offsets) - 1)
-        self._root.attrs["has_4d"] = self.has_4d
-        self._root.attrs["acquisition_mode"] = self.acquisition_mode
-        self._root.attrs["peaks_variables"] = list(
-            ("mz", "intensity", "ion_mobility") if self.has_4d else ("mz", "intensity")
-        )
+        self._root.attrs.update(store_attrs(
+            n_spectra=len(offsets) - 1, has_4d=self.has_4d,
+            acquisition_mode=self.acquisition_mode,
+        ))
         meta = (pd.concat(self._meta_parts, ignore_index=True)
                 if self._meta_parts else pd.DataFrame())
         meta["scan_index"] = np.arange(len(meta), dtype=np.int64)   # global, unique across batches
         if "data_storage" not in meta.columns:
             meta["data_storage"] = self.path
-        meta.to_parquet(Path(self.path) / "spectra.parquet", index=False)
+        meta.to_parquet(Path(self.path) / SPECTRA_METADATA_FILE, index=False)
         return MsBackendZarr(self.path)
+
+
+# Backward-compatible private alias. Internal code should use ZarrStreamWriter.
+_ZarrStreamWriter = ZarrStreamWriter

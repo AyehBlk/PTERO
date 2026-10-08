@@ -33,12 +33,14 @@ from profile to centroid, and the median peaks-per-spectrum should drop sharply.
 """
 from __future__ import annotations
 
-from typing import Callable
+from importlib.metadata import PackageNotFoundError, version
 
 import numpy as np
 
+from ._transforms import FunctionTransform
 
-def make_centroid_transform(signal_to_noise: float = 0.0) -> Callable[[dict], dict]:
+
+def make_centroid_transform(signal_to_noise: float = 0.0) -> FunctionTransform:
     """Build a per-spectrum centroiding transform (pyOpenMS ``PeakPickerHiRes``).
 
     Parameters

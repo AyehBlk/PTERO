@@ -44,6 +44,8 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 
+from ._transforms import PeaksDict, transform_provenance
+
 #: processed-store schema version (bump if the provenance/layout contract changes)
 PROCESSED_SCHEMA_VERSION = 1
 
@@ -52,8 +54,7 @@ PROCESSED_SCHEMA_VERSION = 1
 PROCESSED_FLAG_ATTR = "ptero_processed"
 PROCESSING_PROVENANCE_ATTR = "ptero_processing"
 
-#: a spectrum's peaks as a dict of equal-length 1D arrays.
-PeaksDict = dict          # {"mz": np.ndarray, "intensity": np.ndarray[, "ion_mobility": np.ndarray]}
+#: a per-spectrum peak transform.
 Transform = Callable[[PeaksDict], PeaksDict]
 
 
@@ -146,7 +147,8 @@ def process_store(
     """
     # Imports are local so importing ptero.process is light and so this module
     # has no hard dependency on the raw extra until it is actually used.
-    from ptero.spectra.backends.zarr_backend import MsBackendZarr, _ZarrStreamWriter
+    from ptero.spectra.backends.zarr_backend import MsBackendZarr, ZarrStreamWriter
+    from ptero.spectra.validation import validate_store
     from ptero.spectra.backends.memory import MsBackendMemory
 
     transform = transform or identity_transform
@@ -190,7 +192,7 @@ def process_store(
 
     _log(f"processing {n_total} spectra ({'4D' if has_4d else '3D'}, mode={acq_mode}) -> {out_path}")
 
-    writer = _ZarrStreamWriter(str(out_path), has_4d=has_4d, acquisition_mode=acq_mode)
+    writer = ZarrStreamWriter(str(out_path), has_4d=has_4d, acquisition_mode=acq_mode)
     buf_peaks: list[dict] = []
     buf_idx: list[int] = []
     expected = 0
@@ -263,7 +265,11 @@ def process_store(
         )
 
     writer.finalize()
-    _stamp_provenance(out_path, src_path, n_total, steps or _default_steps())
+    # Validate the physical store before marking it as a completed processed artifact.
+    validate_store(out_path)
+    declared = transform_provenance(transform)
+    effective_steps = steps if steps is not None else ([declared] if declared else _default_steps())
+    _stamp_provenance(out_path, src_path, n_total, effective_steps)
     _log("done")
     return str(out_path)
 

@@ -66,6 +66,10 @@ def pg_path(tmp_path):
 def test_read_sample_names(pg_path):
     assert read_sample_names(pg_path) == SAMPLES
 
+def test_read_sample_names_bad_quantity_raises(pg_path):
+    with pytest.raises(ValueError, match="quantity must be"):
+        read_sample_names(pg_path, quantity="foo")
+
 
 def test_load_basic_shape_and_filtering(pg_path):
     qd = load_quant(pg_path)
@@ -141,3 +145,47 @@ def test_plots_build_headless(pg_path):
         assert isinstance(f, Figure)
     qd2 = load_quant(pg_path)                         # ungrouped path
     assert isinstance(plot_lfq_distributions(qd2), Figure)
+
+def test_negative_quant_value_rejected(pg_path):
+    df = pd.read_csv(pg_path, sep="\t", dtype=str, keep_default_na=False)
+    df.loc[0, "LFQ intensity S_A_1"] = "-100"
+    df.to_csv(pg_path, sep="\t", index=False, encoding="utf-8-sig")
+
+    with pytest.raises(ValueError, match="negative"):
+        load_quant(pg_path)
+
+def test_duplicate_protein_group_ids_rejected(pg_path):
+    df = pd.read_csv(
+        pg_path,
+        sep="\t",
+        dtype=str,
+        keep_default_na=False,
+    )
+    df.loc[1, "id"] = df.loc[0, "id"]
+    df.to_csv(
+        pg_path,
+        sep="\t",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    with pytest.raises(ValueError, match="duplicate protein-group"):
+        load_quant(pg_path)
+
+def test_noninteger_protein_group_id_rejected(pg_path):
+    df = pd.read_csv(
+        pg_path,
+        sep="\t",
+        dtype=str,
+        keep_default_na=False,
+    )
+    df.loc[1, "id"] = "1.5"
+    df.to_csv(
+        pg_path,
+        sep="\t",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    with pytest.raises(ValueError, match="non-integer"):
+        load_quant(pg_path)
