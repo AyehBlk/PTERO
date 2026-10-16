@@ -55,7 +55,177 @@ from . import _dia
 
 # ── tested core (DDA) ─────────────────────────────────────────────────────────
 
-def _timstof_to_spectra(df: pd.DataFrame):
+_BRUKER_ACQUISITION_FIELDS = (
+    "bruker_frame_id",
+    "bruker_precursor_id",
+    "bruker_scan_begin",
+    "bruker_scan_end",
+)
+
+
+def _bruker_group_metadata(group: pd.DataFrame) -> dict:
+    """Preserve optional acquisition IDs only when constant within a group."""
+    extra = {}
+
+    for column in _BRUKER_ACQUISITION_FIELDS:
+        if column not in group.columns:
+            continue
+
+        values = group[column].drop_duplicates()
+
+        if len(values) != 1:
+            raise ValueError(
+                f"Non-unique {column} within one Bruker spectrum group"
+            )
+
+        extra[column] = values.iloc[0]
+
+    return extra
+
+
+def _load_bruker_pasef_events(path) -> pd.DataFrame:
+    """Read authoritative ddaPASEF event identifiers from analysis.tdf."""
+    from pathlib import Path
+    import sqlite3
+
+    database = Path(path) / "analysis.tdf"
+    if not database.is_file():
+        raise FileNotFoundError(database)
+
+    uri = database.resolve().as_uri() + "?mode=ro"
+
+    with sqlite3.connect(uri, uri=True) as connection:
+        events = pd.read_sql_query(
+            """
+            SELECT
+                Frame AS bruker_frame_id,
+                Precursor AS bruker_precursor_id,
+                ScanNumBegin AS bruker_scan_begin,
+                ScanNumEnd AS bruker_scan_end,
+                IsolationMz AS isolation_mz
+            FROM PasefFrameMsMsInfo
+            """,
+            connection,
+        )
+
+    if events.empty:
+        raise ValueError("No Bruker PASEF acquisition events found")
+
+    identity = [
+        "bruker_frame_id",
+        "bruker_scan_begin",
+        "bruker_scan_end",
+    ]
+
+    if events.duplicated(identity).any():
+        raise ValueError("Duplicate Bruker PASEF acquisition intervals")
+
+    return events
+
+
+def _attach_bruker_acquisition_ids(
+    df: pd.DataFrame,
+    events: pd.DataFrame,
+) -> pd.DataFrame:
+    """Assign original Bruker IDs to detector events without guessing.
+
+    Each MS2 detector event must map to exactly one original PASEF
+    acquisition event using its frame, scan position, and isolation m/z.
+    MS1 detector events retain their frame ID and nullable MS2 fields.
+    """
+    required = {"frame", "scan", "ms_level", "precursor_mz"}
+    missing = required - set(df.columns)
+
+    if missing:
+        raise KeyError(
+            f"Bruker detector table lacks acquisition fields: "
+            f"{sorted(missing)}"
+        )
+
+    output = df.copy()
+    output["bruker_frame_id"] = output["frame"].astype("int64")
+
+    for field in (
+        "bruker_precursor_id",
+        "bruker_scan_begin",
+        "bruker_scan_end",
+    ):
+        output[field] = pd.Series(
+            pd.array([pd.NA] * len(output), dtype="Int64"),
+            index=output.index,
+        )
+
+    if output.empty:
+        return output
+
+    ms2 = output["ms_level"].to_numpy() == 2
+
+    if not ms2.any():
+        return output
+
+    # Group by original frame and isolation center to avoid a costly
+    # full event-table comparison for every detector peak.
+    subset = output.loc[ms2]
+
+    for (frame, center), group in subset.groupby(
+        ["frame", "precursor_mz"], sort=False
+    ):
+        candidates = events.loc[
+            (events["bruker_frame_id"] == int(frame))
+            & np.isclose(
+                events["isolation_mz"].to_numpy(dtype=float),
+                float(center),
+                rtol=0,
+                atol=1e-4,
+            )
+        ]
+
+        scans = group["scan"].to_numpy(dtype=np.int64)
+        assignments = np.full(len(group), -1, dtype=np.int64)
+
+        for event_index, event in candidates.iterrows():
+            inside = (
+                (scans >= int(event["bruker_scan_begin"]))
+                & (scans < int(event["bruker_scan_end"]))
+            )
+
+            if (assignments[inside] != -1).any():
+                raise ValueError(
+                    f"Ambiguous Bruker event: frame={frame}, "
+                    f"precursor_mz={center}"
+                )
+
+            assignments[inside] = int(event_index)
+
+        if (assignments < 0).any():
+            raise ValueError(
+                f"Unmatched Bruker detector events: frame={frame}, "
+                f"precursor_mz={center}, count={(assignments < 0).sum()}"
+            )
+
+        matched = events.loc[assignments]
+
+        for field in (
+            "bruker_precursor_id",
+            "bruker_scan_begin",
+            "bruker_scan_end",
+        ):
+            output.loc[group.index, field] = (
+                matched[field].to_numpy(dtype=np.int64)
+            )
+
+    return output
+
+
+def _normalize_bruker_id_dtypes(metadata: pd.DataFrame) -> pd.DataFrame:
+    """Keep original Bruker acquisition identifiers as nullable integers."""
+    for column in _BRUKER_ACQUISITION_FIELDS:
+        if column in metadata.columns:
+            metadata[column] = metadata[column].astype("Int64")
+    return metadata
+
+
+def _timstof_to_spectra_pandas(df: pd.DataFrame):
     """Turn a long timsTOF detector-event table into (meta, peaks).
 
     Groups rows into spectra by ``frame`` (and ``precursor_mz`` when present, so
@@ -91,6 +261,7 @@ def _timstof_to_spectra(df: pd.DataFrame):
             "scan_index": scan_index,
             "precursor_mz": float(prec) if (has_prec and not pd.isna(prec)) else np.nan,
             "ion_mobility": float(np.median(mob)) if mob.size else np.nan,
+            **_bruker_group_metadata(g),
         })
         peaks.append({
             "mz": g["mz"].to_numpy(dtype=np.float64),
@@ -99,7 +270,88 @@ def _timstof_to_spectra(df: pd.DataFrame):
         })
         scan_index += 1
 
-    return pd.DataFrame(meta_rows), peaks
+    return _normalize_bruker_id_dtypes(pd.DataFrame(meta_rows)), peaks
+
+def _timstof_to_spectra(df: pd.DataFrame):
+    """Group DDA timsTOF events into spectra using contiguous NumPy slices."""
+    required = {"frame", "rt", "mobility", "mz", "intensity"}
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(f"timsTOF table is missing required columns: {sorted(missing)}")
+
+    has_prec = "precursor_mz" in df.columns
+    has_lvl = "ms_level" in df.columns
+    group_keys = ["frame", "precursor_mz"] if has_prec else ["frame"]
+
+    # Preserve pandas' established group ordering and stable peak ordering.
+    s = df.sort_values(group_keys, kind="stable")
+
+    if s.empty:
+        return pd.DataFrame(), []
+
+    # Keep unusual group-key dtypes on the original, tested pandas path.
+    if not pd.api.types.is_numeric_dtype(s["frame"].dtype):
+        return _timstof_to_spectra_pandas(df)
+    if has_prec and not pd.api.types.is_numeric_dtype(s["precursor_mz"].dtype):
+        return _timstof_to_spectra_pandas(df)
+
+    frame = s["frame"].to_numpy()
+    prec = (
+        s["precursor_mz"].to_numpy()
+        if has_prec else np.full(len(s), np.nan)
+    )
+
+    # Nullable extension arrays may not support vectorized comparisons.
+    try:
+        same_prec = (
+            (prec[1:] == prec[:-1])
+            | (pd.isna(prec[1:]) & pd.isna(prec[:-1]))
+        )
+        changes = (frame[1:] != frame[:-1]) | ~same_prec
+        boundaries = np.r_[
+            0, np.flatnonzero(changes) + 1, len(s)
+        ]
+    except (TypeError, ValueError):
+        return _timstof_to_spectra_pandas(df)
+
+    rt = s["rt"].to_numpy()
+    mz = s["mz"].to_numpy(dtype=np.float64)
+    intensity = s["intensity"].to_numpy(dtype=np.float64)
+    mobility = s["mobility"].to_numpy(dtype=np.float64)
+    levels = s["ms_level"].to_numpy() if has_lvl else None
+
+    meta_rows, peaks = [], []
+
+    for i, (start, end) in enumerate(
+        zip(boundaries[:-1], boundaries[1:])
+    ):
+        p = prec[start]
+        mob = mobility[start:end]
+
+        if has_lvl:
+            lvl = int(levels[start])
+        else:
+            lvl = 1 if (not has_prec or pd.isna(p)) else 2
+
+        meta_rows.append({
+            "ms_level": lvl,
+            "rtime": float(rt[start]),
+            "scan_index": i,
+            "precursor_mz": (
+                float(p) if has_prec and not pd.isna(p) else np.nan
+            ),
+            "ion_mobility": float(np.median(mob)) if mob.size else np.nan,
+            **_bruker_group_metadata(s.iloc[start:end]),
+        })
+
+        peaks.append({
+            "mz": mz[start:end],
+            "intensity": intensity[start:end],
+            "ion_mobility": mob,
+        })
+
+    return _normalize_bruker_id_dtypes(pd.DataFrame(meta_rows)), peaks
+
 
 
 def from_timstof_dataframe(df: pd.DataFrame, ms_level: Optional[int] = None) -> PteroSpectra:
@@ -191,6 +443,39 @@ def _resolve_bruker_dir(path):
     return str(p)                            # not found -> let _open_timstof raise
 
 
+
+def _alpharaw_framezero_reader(original):
+    """Correct AlphaRaw's synthetic frame zero under pandas Copy-on-Write."""
+    def compatible(*args, **kwargs):
+        import warnings
+        import pandas as pd
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", category=pd.errors.ChainedAssignmentError
+            )
+            result = original(*args, **kwargs)
+
+        add_zero = (
+            args[1] if len(args) > 1
+            else kwargs.get("add_zeroth_frame", True)
+        )
+        if not add_zero:
+            return result
+
+        parts = list(result)
+        frames = parts[2].copy()
+        fields = (
+            "Id", "Time", "MaxIntensity",
+            "SummedIntensities", "NumPeaks", "MsMsType",
+        )
+        frames.loc[0, list(fields)] = 0
+        parts[2] = frames
+        return tuple(parts)
+
+    return compatible
+
+
 def _open_timstof(path, mz_estimation_from_frame: int = 1,
                   mobility_estimation_from_frame: int = 1):
     """Open a ``.d`` once and return the vendor reader object (the slow step:
@@ -205,14 +490,24 @@ def _open_timstof(path, mz_estimation_from_frame: int = 1,
             "and the file is not 0 bytes."
         )
     TimsTOF = _import_timstof_reader()
+
+    # AlphaRaw uses chained assignments for its synthetic frame zero.
+    # Pandas 3 Copy-on-Write ignores those assignments, corrupting
+    # the frame-zero detector-event count and downstream offsets.
+    namespace = TimsTOF._import_data_from_d_folder.__globals__
+    original_reader = namespace["read_bruker_sql"]
+    namespace["read_bruker_sql"] = _alpharaw_framezero_reader(original_reader)
     try:
-        data = TimsTOF(
-            str(path),
-            mz_estimation_from_frame=mz_estimation_from_frame,
-            mobility_estimation_from_frame=mobility_estimation_from_frame,
-        )
-    except TypeError:
-        data = TimsTOF(str(path))  # readers with a simpler signature
+        try:
+            data = TimsTOF(
+                str(path),
+                mz_estimation_from_frame=mz_estimation_from_frame,
+                mobility_estimation_from_frame=mobility_estimation_from_frame,
+            )
+        except TypeError:
+            data = TimsTOF(str(path))  # readers with a simpler signature
+    finally:
+        namespace["read_bruker_sql"] = original_reader
     if not hasattr(data, "__getitem__"):
         raise RuntimeError(
             "The installed timsTOF reader does not expose the data[...] -> DataFrame "

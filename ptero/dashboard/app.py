@@ -61,10 +61,193 @@ _FLAG_GUIDE = (
 )
 
 
+import time as _ptero_time
+import functools as _ptero_functools
+
+def _ptero_profile(fn):
+    """Temporarily time an existing dashboard method."""
+    @_ptero_functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = _ptero_time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            elapsed = _ptero_time.perf_counter() - start
+            print(
+                f"[PTERO PROFILE] {fn.__name__}: "
+                f"{elapsed:.2f} seconds",
+                flush=True,
+            )
+    return wrapper
+
+
+
+def _ptero_cached_initial_qc(sp, level, max_spectra):
+    """Cache dashboard initialization QC without changing the QC API."""
+    from pathlib import Path
+    import hashlib
+    import json
+    import os
+    import pandas as pd
+
+    backend = sp.backend
+    path = getattr(backend, "path", None)
+
+    # Prefer exact, conversion-time QC for complete Zarr datasets.
+    # Subset views must use their own QC instead.
+    if path:
+        try:
+            import numpy as np
+
+            root_group = getattr(backend, "_root", None)
+            indices = getattr(backend, "_idx", None)
+            n_total = getattr(backend, "_n_total", None)
+
+            complete = (
+                root_group is not None
+                and indices is not None
+                and n_total is not None
+                and len(indices) == int(n_total)
+                and np.array_equal(
+                    np.asarray(indices),
+                    np.arange(int(n_total)),
+                )
+            )
+
+            if complete:
+                stored = root_group.attrs.get("ptero_qc_v1")
+                if isinstance(stored, dict) and stored.get("version") == 1:
+                    key = "all" if level == "all" else str(int(level))
+                    group = stored.get("groups", {}).get(key)
+
+                    if isinstance(group, dict):
+                        mzlo = group.get("mz_min")
+                        mzhi = group.get("mz_max")
+                        imlo = group.get("mobility_min")
+                        imhi = group.get("mobility_max")
+
+                        valid = (
+                            mzlo is not None
+                            and mzhi is not None
+                            and np.isfinite(mzlo)
+                            and np.isfinite(mzhi)
+                            and mzlo <= mzhi
+                        )
+
+                        if getattr(sp, "has_4d", False):
+                            valid = (
+                                valid
+                                and imlo is not None
+                                and imhi is not None
+                                and np.isfinite(imlo)
+                                and np.isfinite(imhi)
+                                and imlo <= imhi
+                            )
+
+                        if valid:
+                            print(
+                                "[PTERO PROFILE] initial_qc Zarr metadata HIT",
+                                flush=True,
+                            )
+                            return pd.DataFrame([{
+                                "mz_min": float(mzlo),
+                                "mz_max": float(mzhi),
+                                "mobility_min": (
+                                    float(imlo) if imlo is not None else None
+                                ),
+                                "mobility_max": (
+                                    float(imhi) if imhi is not None else None
+                                ),
+                            }])
+
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            pass
+
+    # Non-Zarr backends retain the original behavior.
+    if not path:
+        view = sp.filter_ms_level(level) if level != "all" else sp
+        return view.qc(max_spectra=max_spectra)
+
+    # Disk-cache keys describe complete datasets, not arbitrary subsets.
+    # Never reuse a whole-dataset cache entry for a filtered backend view.
+    import numpy as np
+
+    indices = getattr(backend, "_idx", None)
+    n_total = getattr(backend, "_n_total", None)
+
+    if indices is not None and n_total is not None:
+        complete = (
+            len(indices) == int(n_total)
+            and np.array_equal(
+                np.asarray(indices),
+                np.arange(int(n_total)),
+            )
+        )
+        if not complete:
+            view = sp.filter_ms_level(level) if level != "all" else sp
+            print(
+                "[PTERO PROFILE] initial_qc subset: bypass disk cache",
+                flush=True,
+            )
+            return view.qc(max_spectra=max_spectra)
+
+    root = Path(path).resolve()
+    metadata = root / "spectra.parquet"
+
+    # Cache only when a metadata sidecar exists.
+    if not metadata.is_file():
+        view = sp.filter_ms_level(level) if level != "all" else sp
+        return view.qc(max_spectra=max_spectra)
+
+    # Fingerprint the dataset metadata and Zarr metadata.
+    # If anything relevant changes, recompute the QC.
+    parts = [str(root), str(level), str(max_spectra)]
+    for f in (metadata, root / "zarr.json", root / ".zattrs"):
+        if f.exists():
+            st = f.stat()
+            parts.extend([str(f), str(st.st_size), str(st.st_mtime_ns)])
+
+    key = hashlib.sha256("|".join(parts).encode()).hexdigest()
+    cache_dir = Path.home() / ".ptero" / "dashboard_qc_cache"
+    cache_file = cache_dir / (key + ".json")
+
+    if cache_file.exists():
+        try:
+            values = json.loads(cache_file.read_text(encoding="utf-8"))
+            q = pd.DataFrame([values])
+            for col in ("mz_min", "mz_max"):
+                if col not in q or not pd.notna(q[col].iloc[0]):
+                    raise ValueError("Incomplete cache")
+            print("[PTERO PROFILE] initial_qc cache HIT", flush=True)
+            return q
+        except (ValueError, OSError, TypeError, KeyError):
+            pass
+
+    view = sp.filter_ms_level(level) if level != "all" else sp
+    q = view.qc(max_spectra=max_spectra)
+
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        values = q.iloc[0].to_dict()
+        values = {
+            k: (v.item() if hasattr(v, "item") else v)
+            for k, v in values.items()
+        }
+        temp = cache_file.with_suffix(".tmp")
+        temp.write_text(json.dumps(values), encoding="utf-8")
+        os.replace(temp, cache_file)
+        print("[PTERO PROFILE] initial_qc cache MISS (saved)", flush=True)
+    except (OSError, TypeError, ValueError):
+        pass
+
+    return q
+
+
 class Dashboard:
     OVERVIEW_MAX_SPECTRA = 600          # scans sampled only to set initial slider ranges
 
-    def __init__(self):
+    def __init__(self, state=None):
+        self.state = state
         self.sp: PteroSpectra | None = None
 
         # ── data-source widgets ──
@@ -90,7 +273,7 @@ class Dashboard:
         self.conv_batch = pn.widgets.IntInput(name="Frames/batch", value=500, start=50, step=50, width=120)
         self.conv_workers = pn.widgets.IntInput(
             name="Parallel workers (many files)", value=2, start=1, end=8, step=1, width=180)
-        self.conv_overwrite = pn.widgets.Checkbox(name="Overwrite existing", value=False, width=150)
+
         self.conv_btn = pn.widgets.Button(name="Create PTERO Dataset", button_type="primary", width=160)
 
         # the sample switcher (shown on the View panel only when 2+ samples are loaded)
@@ -140,8 +323,13 @@ class Dashboard:
         await asyncio.sleep(0.05)
 
     # ── loading ──────────────────────────────────────────────────────────
+    @_ptero_profile
     def _set_data(self, sp: PteroSpectra, msg: str):
         self.sp = sp
+        if self.state is not None:
+            active_name = self.sample_sel.value
+            self.state.set("raw_store", sp)
+            self.state.set("raw_sample", active_name)
         lvls = [int(x) for x in sorted(sp.spectra_data(["ms_level"])["ms_level"].unique().tolist())]
         self.ms_sel.options = ["all"] + lvls
         # Default to MS1 when present: it's the fast, standard precursor view. A
@@ -155,7 +343,13 @@ class Dashboard:
         range_sp = sp.filter_ms_level(1) if default_lvl == 1 else sp
         sd = range_sp.spectra_data(["rtime"])
         rtmin, rtmax = float(sd["rtime"].min()), float(sd["rtime"].max())
-        q = range_sp.qc(max_spectra=self.OVERVIEW_MAX_SPECTRA)
+        qc_start = _ptero_time.perf_counter()
+        q = _ptero_cached_initial_qc(sp, default_lvl, self.OVERVIEW_MAX_SPECTRA)
+        print(
+            f"[PTERO PROFILE] initial_qc: "
+            f"{_ptero_time.perf_counter() - qc_start:.2f} seconds",
+        flush=True,
+        )
         mzmin, mzmax = float(q["mz_min"][0]), float(q["mz_max"][0])
         mzpad = max((mzmax - mzmin) * 0.02, 1.0)
         self.rt.param.update(start=rtmin, end=max(rtmax, rtmin + 1e-6), value=(rtmin, rtmax))
@@ -176,8 +370,17 @@ class Dashboard:
             hint = (" — showing **MS1** by default. Switch the MS level selector to MS2 or "
                     "'all' for fragment data (note: 'all' reads every MS2 scan and can be slow "
                     "on a large run — narrow the RT slider first).")
-        self.status.object = f"✅ {msg}{hint}"
+        self.status.object = (
+            "⏳ **PTERO is preparing your dataset visualization...**\n\n"
+            "Reading spectra and generating interactive chromatograms, "
+            "mass spectra, feature maps, and quality-control results. "
+            "Large datasets may take several minutes."
+        )
         self._render()
+        self.status.object = (
+            f"<span style='color:#16803c; font-size:17px;'>●</span> "
+            f"**Visualization ready.** {msg}{hint}"
+        )
 
     async def _open(self, event=None):
         spec = self.zarr_path.value.strip()
@@ -295,6 +498,12 @@ class Dashboard:
                     stem = stem[: -len(suf)]
                     break
             out = str(_P(outdir) / (stem + ".zarr"))
+            if _P(out).exists():
+                self.status.object = (
+                    f"Conversion stopped: output already exists: `{out}`. "
+                    "Choose a new output folder to preserve the existing dataset."
+                )
+                return
             scope = f" frames {frames[0]}-{frames[1]}" if frames else " (full run)"
             await self._show_loading(
                 f"⏳ Converting `{src}`{scope} → `{out}`: detecting profile/centroid and, if profile, "
@@ -322,7 +531,7 @@ class Dashboard:
             results = await asyncio.to_thread(
                 convert_many, inputs, outdir,
                 ms_level=self.conv_ms.value, frame_batch=int(self.conv_batch.value),
-                max_workers=workers, overwrite=bool(self.conv_overwrite.value))
+                max_workers=workers, overwrite=False)
         except Exception as e:
             self.status.object = f"❌ **Batch failed:** {e}"
             return
@@ -398,6 +607,10 @@ class Dashboard:
                 k += 1
             samples[name] = str(p)
         self._samples = samples
+        if self.state is not None:
+            self.state.set("raw_datasets", dict(samples))
+            self.state.set("raw_sample", None)
+            self.state.set("raw_store", None)
         names = list(samples)
         self._suspend_sample_watch = True
         try:
@@ -441,6 +654,7 @@ class Dashboard:
         return sp
 
     # ── full-fidelity overview (one pass, all peaks) ──────────────────────
+    @_ptero_profile
     def _full_overview(self, sp):
         """Read every scan in the selection and aggregate ALL peaks into the
         three density maps, computing the chromatogram, per-scan peak counts and
@@ -475,28 +689,52 @@ class Dashboard:
         buf_pts = 0; total_pts = 0
         BATCH_PTS = 4_000_000
 
+        # Temporary performance instrumentation; no calculation changes.
+        import time as _overview_time
+        _t_start = _overview_time.perf_counter()
+        _t_dataframe = 0.0
+        _t_datashader = 0.0
+        _t_reader = 0.0
+        _t_processing = 0.0
+
         def flush():
             nonlocal acc_fm, acc_mob, acc_rtim, buf_rt, buf_mz, buf_int, buf_im, buf_pts
+            nonlocal _t_dataframe, _t_datashader
             if not buf_mz:
                 return
+            _t0 = _overview_time.perf_counter()
             df = pd.DataFrame({"rt": np.concatenate(buf_rt), "mz": np.concatenate(buf_mz),
                                "intensity": np.concatenate(buf_int)})
+            if want_im:
+                df["ion_mobility"] = np.concatenate(buf_im)
+            _t_dataframe += _overview_time.perf_counter() - _t0
+            _t0 = _overview_time.perf_counter()
             a = cvs_fm.points(df, "rt", "mz", dsh.sum("intensity"))
             acc_fm = a.fillna(0) if acc_fm is None else acc_fm + a.fillna(0)
             if want_im:
-                df["ion_mobility"] = np.concatenate(buf_im)
                 b = cvs_mob.points(df, "mz", "ion_mobility", dsh.sum("intensity"))
                 acc_mob = b.fillna(0) if acc_mob is None else acc_mob + b.fillna(0)
                 c = cvs_rtim.points(df, "rt", "ion_mobility", dsh.sum("intensity"))
                 acc_rtim = c.fillna(0) if acc_rtim is None else acc_rtim + c.fillna(0)
+            _t_datashader += _overview_time.perf_counter() - _t0
             buf_rt, buf_mz, buf_int, buf_im = [], [], [], []
             buf_pts = 0
 
         seen = 0
-        for i, P in sp.iter_peaks(columns=cols):
+        _peak_iterator = iter(sp.iter_peaks(columns=cols, block_size=8_000_000))
+        while True:
+            _t0 = _overview_time.perf_counter()
+            try:
+                i, P = next(_peak_iterator)
+            except StopIteration:
+                _t_reader += _overview_time.perf_counter() - _t0
+                break
+            _t_reader += _overview_time.perf_counter() - _t0
+            _t0 = _overview_time.perf_counter()
             seen += 1
             k = P.shape[0]; npks[i] = k
             if k == 0:
+                _t_processing += _overview_time.perf_counter() - _t0
                 continue
             inten = P[:, 1]; mz = P[:, 0]
             tic[i] = inten.sum(); bpc[i] = inten.max()
@@ -511,10 +749,22 @@ class Dashboard:
             if want_im:
                 buf_im.append(P[:, 2])
             buf_pts += k; total_pts += k
+            _t_processing += _overview_time.perf_counter() - _t0
             if buf_pts >= BATCH_PTS:
                 flush()
                 print(f"[overview] {seen}/{n} scans, {total_pts:,} peaks aggregated", flush=True)
         flush()
+        _t_total = _overview_time.perf_counter() - _t_start
+        print(
+            f"[PTERO PROFILE] overview timing: "
+            f"total={_t_total:.2f}s, "
+            f"dataframe={_t_dataframe:.2f}s, "
+            f"datashader={_t_datashader:.2f}s, "
+            f"reader={_t_reader:.2f}s, "
+            f"processing={_t_processing:.2f}s, "
+            f"remaining={_t_total - _t_dataframe - _t_datashader - _t_reader - _t_processing:.2f}s",
+            flush=True,
+        )
         print(f"[overview] done: {n} scans, {total_pts:,} peaks", flush=True)
 
         def _image(acc, cmap, title, xlabel, ylabel):
@@ -707,11 +957,28 @@ class Dashboard:
                                  x_range=(rt_lo, rt_hi), y_range=(im_lo, im_hi))
                 agg = cvs.points(pd.DataFrame({"rt": fr, "im": fm, "intensity": fi}),
                                  "rt", "im", dsh.sum("intensity"))
+                from bokeh.models import HoverTool, CustomJSHover
+                intensity_hover = CustomJSHover(code="""
+                    if (value == null || String(value).trim() === "" || !Number.isFinite(Number(value))) {
+                        return "No signal";
+                    }
+                    return Number(value).toLocaleString(undefined, {
+                        maximumFractionDigits: 2
+                    });
+                """)
+                footprint_hover = HoverTool(
+                    tooltips=[
+                        ("RT (s)", "$x{0.000}"),
+                        ("1/K0", "$y{0.000}"),
+                        ("Summed intensity", "@image{custom}"),
+                    ],
+                    formatters={"@image": intensity_hover},
+                )
                 foot = hv.Image(agg.where(agg > 0)).opts(
                     width=820, height=300, cmap=cc.bmy, cnorm="eq_hist", colorbar=True,
                     clabel="summed intensity", title=f"RT × 1/K0 footprint — m/z {targets[0][1]} ± {tol}",
                     xlabel="RT (s)", ylabel="1/K0",
-                    tools=["hover", "wheel_zoom", "box_zoom", "pan", "reset"], active_tools=["wheel_zoom"])
+                    tools=[footprint_hover, "wheel_zoom", "box_zoom", "pan", "reset"], active_tools=["wheel_zoom"])
                 panes.append(pn.pane.HoloViews(foot, sizing_mode="stretch_width"))
                 panes.append(pn.pane.Markdown(
                     "_Footprint: where this ion sits in **both** RT and ion mobility — it pinpoints "
@@ -734,6 +1001,7 @@ class Dashboard:
             self.xic_panel[:] = [pn.pane.Markdown(f"❌ XIC error: {e}")]
 
     # ── diagnostics + precursor builders ──────────────────────────────────
+    @_ptero_profile
     def _diagnostics(self, res):
         rt_all, npks, lvl_all = res["rt_all"], res["npks"], res["lvl_all"]
         order = np.argsort(rt_all)
@@ -753,6 +1021,7 @@ class Dashboard:
             "MS1 cycle time is the gap between consecutive survey scans._"))
         return pn.Column(*items, sizing_mode="stretch_width")
 
+    @_ptero_profile
     def _precursor(self):
         # Precursor data is inherently MS2 and comes from metadata only (fast even
         # for huge MS2 counts), so it ignores the MS-level selector and always
@@ -815,6 +1084,7 @@ class Dashboard:
         except Exception:
             return False
 
+    @_ptero_profile
     def _window_scheme(self):
         """diaPASEF isolation windows as boxes in m/z × 1/K0 — the DIA analogue of
         the DDA 'Precursor' tab. The scheme is a property of the acquisition
@@ -982,6 +1252,7 @@ class Dashboard:
             plots_card,
         ]
 
+    @_ptero_profile
     def _render(self, event=None):
         if self.sp is None:
             return
@@ -1068,20 +1339,35 @@ class Dashboard:
 
             self.plot_panel[:] = [pn.Tabs(*tabs)]
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.plot_panel[:] = [pn.pane.Markdown(f"❌ **Render error:** {e}")]
 
     async def _on_update(self, event=None):
         if self.sp is None:
             return
-        prev = self.status.object
-        self.status.object = "⏳ Updating plots for the current selection — progress prints in the server terminal."
+
+        self.status.object = (
+            "**Preparing visualization…**\n\n"
+            "Reading spectra and generating interactive plots. "
+            "Large datasets may take several minutes."
+        )
         self.plot_panel.loading = True
-        await asyncio.sleep(0.05)
+        self.update_btn.disabled = True
+
+        await asyncio.sleep(0.1)
+
         try:
             self._render()
+            self.status.object = (
+                "**Visualization ready.** "
+                "Interactive plots are ready to explore."
+            )
+        except Exception as e:
+            self.status.object = f"**Visualization failed:** {e}"
         finally:
             self.plot_panel.loading = False
-            self.status.object = prev
+            self.update_btn.disabled = False
 
     async def _on_xic(self, event=None):
         self.xic_panel.loading = True
@@ -1092,78 +1378,144 @@ class Dashboard:
             self.xic_panel.loading = False
 
     # ── layout ─────────────────────────────────────────────────────────────
+
     def view(self):
         from ._browse import browse_field
-        open_help = ("One PTERO Dataset, or a folder of PTERO Datasets to load several samples at once "
-                     "(several paths also work — one per line or comma-separated). With 2+ samples, "
-                     "switch between them with the Sample selector on the View panel.")
-        convert_help = ("One raw file converts to a single store; a folder or several paths convert "
-                        "in parallel, each to its own PTERO Dataset. The result(s) load as samples. PTERO "
-                        "detects profile vs centroid: a .d is already centroid (instrument peak-picked), "
-                        "and a single profile mzML is centroided on convert (needs pyopenms). Note: the "
-                        "parallel path does not centroid profile mzML yet — convert those one at a time "
-                        "for now.")
+
+        open_help = (
+            "Open one PTERO Dataset, a folder of datasets, or several paths. "
+            "When multiple samples are loaded, switch between them using "
+            "the Sample selector."
+        )
+        convert_help = (
+            "Convert Bruker .d or mzML raw files into PTERO Datasets. "
+            "Profile mzML centroiding requires pyopenms. "
+            "For profile mzML, convert one file at a time."
+        )
+
+        # Dataset management: compact and collapsible.
         open_section = pn.Column(
-            pn.Row(pn.pane.Markdown("## 1 · Open PTERO Dataset"),
-                   pn.widgets.TooltipIcon(value=open_help), align="center"),
-            pn.Row(browse_field(self.zarr_path, patterns=["*.zarr"], width=620),
-                   pn.Column(pn.Spacer(height=18), self.open_btn)),
-            sizing_mode="stretch_width")
+            pn.Row(
+                pn.pane.Markdown("### Open PTERO Dataset"),
+                pn.widgets.TooltipIcon(value=open_help),
+                align="center",
+            ),
+            pn.Row(
+                browse_field(
+                    self.zarr_path,
+                    patterns=["*.zarr"],
+                    width=620,
+                ),
+                pn.Column(
+                    pn.Spacer(height=18),
+                    self.open_btn,
+                ),
+            ),
+            sizing_mode="stretch_width",
+        )
+
         convert_section = pn.Column(
-            pn.Row(pn.pane.Markdown("## 2 · Create PTERO Dataset"),
-                   pn.widgets.TooltipIcon(value=convert_help), align="center"),
-            browse_field(self.conv_input, patterns=["*.d", "*.mzML"], width=620),
-            pn.Row(self.conv_outdir, self.conv_ms, self.conv_frames, self.conv_batch),
-            pn.Row(self.conv_workers, self.conv_overwrite,
-                   pn.Column(pn.Spacer(height=18), self.conv_btn)),
-            sizing_mode="stretch_width")
-        source = pn.Column(
-            open_section,
-            pn.layout.Divider(),
-            convert_section,
-            self.status, sizing_mode="stretch_width")
-        controls = pn.Column(
-            pn.pane.Markdown("## 3 · View"),
+            pn.Row(
+                pn.pane.Markdown("### Create PTERO Dataset"),
+                pn.widgets.TooltipIcon(value=convert_help),
+                align="center",
+            ),
+            browse_field(
+                self.conv_input,
+                patterns=["*.d", "*.mzML"],
+                width=620,
+            ),
+            pn.Row(
+                self.conv_outdir,
+                self.conv_ms,
+                self.conv_frames,
+                self.conv_batch,
+
+            ),
+            pn.Row(
+                self.conv_workers,
+                    pn.Column(
+                    pn.Spacer(height=18),
+                    self.conv_btn,
+                ),
+
+            ),
+            sizing_mode="stretch_width",
+        )
+
+        dataset_tools = pn.Accordion(
+            ("Open dataset", open_section),
+            ("Convert raw data", convert_section),
+            active=[],
+            sizing_mode="stretch_width",
+        )
+
+        # Keep loading and completion messages visible.
+        status_bar = pn.Column(
+            self.status,
+            sizing_mode="stretch_width",
+        )
+
+        # Compact visualization controls.
+        controls = pn.Card(
             self.sample_sel,
-            self.ms_sel, self.rt, self.mz, self.im, self.update_btn, width=340)
+            self.ms_sel,
+            self.rt,
+            self.mz,
+            self.im,
+            self.update_btn,
+            title="View controls",
+            collapsed=False,
+            width=330,
+        )
+
+        # Give most of the available space to scientific plots.
+        workspace = pn.Row(
+            controls,
+            self.plot_panel,
+            sizing_mode="stretch_width",
+        )
+
         return pn.Column(
-            pn.pane.Markdown("# PTERO — Raw Data Dashboard"),
-            source, pn.layout.Divider(),
-            pn.Row(controls, self.plot_panel, sizing_mode="stretch_width"),
-            sizing_mode="stretch_width")
+            pn.pane.Markdown("## Raw Data Explorer"),
+            dataset_tools,
+            status_bar,
+            pn.layout.Divider(),
+            workspace,
+            sizing_mode="stretch_width",
+        )
 
 
-def build_raw_page():
-    """The raw-data / converter page (the original single-page dashboard)."""
-    return Dashboard().view()
+def build_raw_page(state=None):
+    """Build the raw-data dashboard."""
+    return Dashboard(state=state).view()
 
 
 def build_app():
-    """Build the multi-page PTERO dashboard and return a servable template.
-
-    Pages share one :class:`~ptero.dashboard._state.AppState` so inputs loaded on
-    one page are visible to others. The converter / raw-data dashboard is the
-    main page; the ID-annotation page is page 1. More pages slot in here later.
-
-    Returned object is a Panel template; call ``.servable()`` to serve it.
-    """
+    """Build the multi-page PTERO application."""
     from ._state import AppState
     from .ids_view import IdsView
     from .de_view import DeView
 
     state = AppState()
 
-    raw_page = build_raw_page()
+    raw_page = build_raw_page(state)
     ids_page = IdsView(state).view()
     de_page = DeView(state).view()
 
     template = pn.template.FastListTemplate(
         title="PTERO",
-        sidebar=[pn.pane.Markdown("### Pages\nUse the tabs in the main area to switch pages.")],
-        main=[pn.Tabs(
-            ("Raw data", raw_page),
-            ("Identifications", ids_page),
-            ("Differential expression", de_page),
-        )],
+        sidebar=[],
+        sidebar_width=0,
+        main=[
+            pn.Tabs(
+                ("Raw data", raw_page),
+                ("Identifications", ids_page),
+                ("Differential Protein Abundance", de_page),
+                sizing_mode="stretch_width",
+            )
+        ],
+        main_max_width="100%",
     )
+
     return template

@@ -50,6 +50,7 @@ array -> ``has_4d = False``; no isolation window -> no extra columns.
 """
 from __future__ import annotations
 
+import re
 from typing import Optional, Sequence
 
 import numpy as np
@@ -186,7 +187,12 @@ def _meta_row(spec, index: int, origin: str) -> dict:
     mob = _scan_mobility(spec)
     if mob != mob:                                # NaN -> try IM-limit midpoint
         mob = _spectrum_mobility(spec)
+    native_id = str(spec.get("id", ""))
+    scan_match = re.search(r"(?:^|\s)scan=(\d+)(?=\s|$)", native_id)
+    acquisition_num = int(scan_match.group(1)) if scan_match else pd.NA
     row = {
+        "native_spectrum_id": native_id,
+        "acquisition_num": acquisition_num,
         "ms_level": lvl,
         "rtime": _scan_start_time(spec),
         "scan_index": index,

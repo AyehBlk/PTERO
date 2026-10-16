@@ -140,3 +140,53 @@ class IdentificationData:
             "_seq": sub["Sequence"],          # plain AA sequence, for PSM lookup
         })
         return out.sort_values("score", ascending=False, na_position="last").reset_index(drop=True)
+
+
+def run_identification_index(msms_path: str) -> dict:
+    """Index direct MaxQuant PSM support by raw run and protein group.
+
+    Returns entries keyed by exact MaxQuant Raw file values, containing:
+    groups, sequences, and group_sequences.
+
+    These represent direct MS/MS support, not per-run protein inference,
+    match-between-runs evidence, or quantitative abundance.
+    """
+    from collections import defaultdict
+    import csv
+
+    index = {}
+
+    with open(msms_path, "r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter=chr(9))
+        required = {"Raw file", "Sequence", "Protein group IDs"}
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                "msms.txt missing required columns: "
+                + ", ".join(sorted(missing))
+            )
+
+        for row in reader:
+            run = (row["Raw file"] or "").strip()
+            sequence = (row["Sequence"] or "").strip()
+            if not run or not sequence:
+                continue
+
+            if run not in index:
+                index[run] = {
+                    "groups": set(),
+                    "sequences": set(),
+                    "group_sequences": defaultdict(set),
+                }
+
+            entry = index[run]
+            entry["sequences"].add(sequence)
+
+            for group_id in (row["Protein group IDs"] or "").split(";"):
+                group_id = group_id.strip()
+                if not group_id:
+                    continue
+                entry["groups"].add(group_id)
+                entry["group_sequences"][group_id].add(sequence)
+
+    return index

@@ -56,19 +56,71 @@ class IdsView:
     def __init__(self, state: AppState | None = None):
         self.state = state if state is not None else AppState()
         self._match = None       # last PsmMatch (for the plots)
+        self._bruker_associations = None  # native Bruker PSM-to-MS2 associations
+        self._bruker_selected_psm = None
+        self._bruker_spectrum_indices = ()
+        self._updating_bruker_selector = False
+        self._xic_request = None
+
+        # Shown only when a selected PSM has native Bruker associations.
+        # Each option represents one distinct stored MS2 spectrum.
+        self.bruker_spectrum_selector = pn.widgets.Select(
+            name="Associated Bruker MS2 spectrum",
+            options=[],
+            value=None,
+            width=460,
+            visible=False,
+        )
+        self.bruker_association_note = pn.pane.Markdown(
+            "",
+            visible=False,
+        )
         self._last_spectrum = None   # (annotated DataFrame, title) for redraws
         self._iddata = None      # IdentificationData (protein+peptide tables)
-        self._psm_by_seq = {}    # plain peptide sequence -> best PSM (for lookup)
+        self._psm_by_seq = {}    # (sequence, run) -> best PSM
+        self._run_id_index = {}   # run -> direct PSM-supported groups/sequences
+        self._native_scan_runs = set()
+        self._updating_run_selector = False
+        self.run_selector = pn.widgets.Select(
+            name="Experimental run",
+            options=[],
+            value=None,
+            width=460,
+            visible=False,
+        )
         self._pep_df = None      # current peptide table (for the selected protein)
+        self.peptide_heading = pn.pane.Markdown(
+            "### Peptides - direct PSM support in selected run"
+        )
         self._fasta = None       # ProteinSequences (Stage 2), or None if not loaded
         self._coverage_mapping = None   # current PeptideMapping (for peptide highlight)
         self._mod_sites = None       # ModificationSites (Stage 3), or None
+        self._run_mod_site_ids = {}  # raw run -> modification -> site IDs
         self._coverage_sites = []    # sites for the currently shown protein
+        self._coverage_protein_row = None
+        self._coverage_highlight_peptide = None
+        self._updating_accession_selector = False
+        self.accession_selector = pn.widgets.Select(
+            name="FASTA protein accession",
+            options=[],
+            value=None,
+            width=340,
+            visible=False,
+        )
 
         # ── inputs ──
+        self.dataset_source = pn.widgets.RadioButtonGroup(
+            name="PTERO Dataset source",
+            options=["Use datasets from Raw Data",
+                     "Open PTERO Dataset separately"],
+            value="Use datasets from Raw Data",
+        )
         self.store_path = pn.widgets.TextInput(
-            name="Spectra Source (PTERO Dataset or mzML)",
-            placeholder=r"C:\data\run.zarr   or   C:\data\run.mzML", width=460)
+            name="PTERO Dataset (or folder of PTERO Datasets)",
+            placeholder=r"C:\data\run.zarr   or   C:\data\datasets",
+            width=460, visible=False)
+        self.dataset_source.param.watch(
+            self._on_dataset_source_change, "value")
         self.txt_dir = pn.widgets.TextInput(
             name="MaxQuant txt folder",
             placeholder=r"C:\data\combined\txt", width=460)
@@ -78,10 +130,18 @@ class IdsView:
         self.load_btn = pn.widgets.Button(name="Load identifications", button_type="primary", width=170)
 
         self.status = pn.pane.Markdown(
-            "**No identifications loaded.** Enter a spectra source (PTERO Dataset or "
-            "mzML) and the MaxQuant `txt` folder, then Load.")
+            "**No identifications loaded.** Reuse PTERO Datasets from Raw Data "
+            "or open them separately, then select the MaxQuant `txt` folder.")
 
         # ── protein table (top, selectable) ──
+        self.protein_search = pn.widgets.TextInput(
+            name="Search proteins",
+            placeholder="Gene, protein name, or UniProt accession",
+            width=460,
+        )
+        self._displayed_protein_groups = None
+        self._updating_protein_table = False
+
         self.protein_table = pn.widgets.Tabulator(
             pd.DataFrame(columns=["gene", "protein", "n_peptides", "n_unique",
                                   "razor_unique", "coverage_pct", "n_psms", "score"]),
@@ -102,6 +162,9 @@ class IdsView:
             pn.pane.Markdown("_Select a protein, then a peptide, to see its annotated spectrum._"),
             sizing_mode="stretch_width")
         self.xic_panel = pn.Column(sizing_mode="stretch_width")
+        self.xic_button = pn.widgets.Button(
+            name="Generate precursor XIC",
+            button_type="default", width=220, disabled=True)
         self.info_panel = pn.pane.Markdown("")
 
         # display toggle: hide unmatched (grey) peaks to see just the b/y ladder
@@ -110,17 +173,41 @@ class IdsView:
 
         # ── wiring ──
         self.load_btn.on_click(self._on_load)
+        self.xic_button.on_click(self._on_generate_xic)
         self.protein_table.param.watch(self._on_select_protein, "selection")
+        self.protein_search.param.watch(self._on_protein_search, "value")
         self.peptide_table.param.watch(self._on_select_peptide, "selection")
+        self.run_selector.param.watch(self._on_select_run, "value")
         self.annotated_only.param.watch(self._on_redraw_spectrum, "value")
+        self.bruker_spectrum_selector.param.watch(self._on_select_bruker_spectrum, "value")
+        self.accession_selector.param.watch(
+            self._on_select_coverage_accession, "value"
+        )
 
     # ── loading ──────────────────────────────────────────────────────────
+    def _on_dataset_source_change(self, event):
+        self.store_path.visible = (
+            event.new == "Open PTERO Dataset separately")
+
     async def _on_load(self, event=None):
         from pathlib import Path
+        self._xic_request = None
+        self.xic_button.disabled = True
+        self.xic_panel[:] = []
+        use_raw = self.dataset_source.value == "Use datasets from Raw Data"
         store_path = self.store_path.value.strip()
+        shared_datasets = dict(self.state.raw_datasets) if use_raw else {}
         txt_dir = self.txt_dir.value.strip()
-        if not (store_path and txt_dir):
-            self.status.object = "⚠️ Enter a spectra store (.zarr or mzML) and the MaxQuant `txt` folder."
+        if not txt_dir:
+            self.status.object = "⚠️ Select the MaxQuant `txt` folder."
+            return
+        if use_raw and not shared_datasets:
+            self.status.object = (
+                "No PTERO Datasets are registered in Raw Data. "
+                "Open or convert them there, or select the separate option.")
+            return
+        if not use_raw and not store_path:
+            self.status.object = "Select a PTERO Dataset or dataset folder."
             return
         folder = Path(txt_dir)
         if not folder.is_dir():
@@ -161,40 +248,217 @@ class IdsView:
         self.status.object = (
             f"⏳ Found {', '.join(found)}"
             + (f"; not found: {', '.join(opt_note)}" if opt_note else "")
-            + ". Loading mzML metadata, PSMs and protein/peptide tables…")
+            + ". Loading PTERO Dataset metadata, PSMs and protein/peptide tables…")
         self.spectrum_panel.loading = True
         await asyncio.sleep(0.05)
         try:
             from .. import ids
-            from ._ids_data import IdentificationData
+            from ._ids_data import IdentificationData, run_identification_index
 
-            store = _open_spectra_store(store_path)       # PTERO .zarr or mzML (lazy)
+            source_path = None if use_raw else Path(store_path)
+            multi_run = use_raw or (
+                source_path.is_dir()
+                and source_path.suffix.lower() != ".zarr"
+                and not (source_path / "offsets").exists()
+            )
+            if not multi_run and source_path.suffix.lower() != ".zarr":
+                raise ValueError(
+                    "Identification requires a PTERO .zarr store "
+                    "or a folder containing .zarr stores."
+                )
+            store = None if multi_run else _open_spectra_store(store_path)
+
             psms = ids.read_psms(msms)
             n_mob = ids.attach_mobility_from_maxquant(psms, accum) if accum else 0
             n_mod = ids.convert_psm_modifications(psms, summary_path=summary)
 
             run_id = psms[0].run if len(psms) else "run"
             reg = ids.RunRegistry()
-            reg.register(run_id, store)
+            if multi_run:
+                expected_runs = {str(p.run) for p in psms}
+                if not expected_runs:
+                    raise ValueError("No MaxQuant PSM runs found.")
+
+                if use_raw:
+                    candidates = [Path(p) for p in shared_datasets.values()]
+                else:
+                    candidates = [
+                        path for path in source_path.iterdir()
+                        if path.is_dir() and path.suffix.lower() == ".zarr"
+                    ]
+                by_name = {}
+                for path in candidates:
+                    if path.suffix.lower() != ".zarr" or not path.is_dir():
+                        raise ValueError(
+                            f"Missing or invalid PTERO Dataset: {path}")
+                    key = path.stem.casefold()
+                    if key in by_name:
+                        raise ValueError(
+                            f"Ambiguous PTERO Dataset name: {path.stem}"
+                        )
+                    by_name[key] = path
+
+                # A single registered dataset and a single MaxQuant run
+                # form an unambiguous user-selected association, even when
+                # the dataset has a validation-specific filename.
+                # Multiple runs always require exact name matching.
+                if use_raw and len(by_name) == 1 and len(expected_runs) == 1:
+                    only_run = next(iter(expected_runs))
+                    only_path = next(iter(by_name.values()))
+                    by_name[only_run.casefold()] = only_path
+
+                missing = sorted(
+                    name for name in expected_runs
+                    if name.casefold() not in by_name
+                )
+                if missing:
+                    raise ValueError(
+                        "Missing PTERO Datasets for MaxQuant runs: "
+                        + ", ".join(missing)
+                    )
+
+                active_path = None
+                if use_raw and self.state.raw_sample in shared_datasets:
+                    active_path = Path(
+                        shared_datasets[self.state.raw_sample]).resolve()
+                for name in sorted(expected_runs):
+                    matched = by_name[name.casefold()]
+                    if (use_raw and self.state.raw_store is not None
+                            and active_path == matched.resolve()):
+                        reg.register(name, self.state.raw_store)
+                    else:
+                        reg.register(name, str(matched))
+
+                run_id = sorted(expected_runs)[0]
+                store = reg.get(run_id)
+            else:
+                expected_runs = {str(p.run) for p in psms}
+                if len(expected_runs) > 1:
+                    raise ValueError(
+                        "MaxQuant contains multiple experimental runs. "
+                        "Select the matching PTERO Dataset folder "
+                        "or use datasets from Raw Data.")
+                reg.register(run_id, store)
+
+            if multi_run:
+                matched_store_path = by_name[run_id.casefold()]
+            else:
+                matched_store_path = source_path
+
+            # Native Bruker linking is opt-in by data capability.
+            # mzML, Thermo, and legacy Zarr retain property-based matching.
+            self._bruker_associations = None
+            self._bruker_selected_psm = None
+            self._bruker_spectrum_indices = ()
+            self.bruker_spectrum_selector.visible = False
+            self.bruker_association_note.visible = False
+            if accum and len(reg.runs()) == 1 and matched_store_path.is_dir():
+                import pyarrow.parquet as pq
+
+                metadata_path = matched_store_path / "spectra.parquet"
+                if metadata_path.is_file():
+                    available = set(
+                        pq.read_schema(metadata_path).names
+                    )
+                    required = {
+                        "scan_index", "ms_level", "bruker_precursor_id"
+                    }
+                    if required.issubset(available):
+                        native_metadata = pd.read_parquet(
+                            metadata_path,
+                            columns=sorted(required),
+                        )
+                        if (
+                            native_metadata.loc[
+                                native_metadata["ms_level"] == 2,
+                                "bruker_precursor_id",
+                            ].notna().all()
+                        ):
+                            self._bruker_associations = (
+                                ids.BrukerPsmAssociations(
+                                    accum, native_metadata
+                                )
+                            )
             self._registry = reg
+            self._multi_run = multi_run
 
             by_seq = {}
             for p in psms:
                 if p.peptidoform is None:
                     continue
-                seq = p.peptidoform.sequence
-                sc = getattr(p, "score", None) or float("-inf")
-                if seq not in by_seq or sc > (getattr(by_seq[seq], "score", None) or float("-inf")):
-                    by_seq[seq] = p
+                key = (p.peptidoform.sequence, str(p.run))
+                sc = getattr(p, "score", None)
+                sc = float(sc) if sc is not None else float("-inf")
+                old = by_seq.get(key)
+                old_score = getattr(old, "score", None) if old is not None else None
+                old_score = (
+                    float(old_score)
+                    if old_score is not None else float("-inf")
+                )
+                if old is None or sc > old_score:
+                    by_seq[key] = p
             self._psm_by_seq = by_seq
 
+            # Exact native-scan matching is enabled only for stores whose
+            # MS2 acquisition numbers are complete and unique.
+            self._native_scan_runs = set()
+            import pyarrow.parquet as pq
+
+            for name in reg.runs():
+                zarr_path = (
+                    by_name[name.casefold()]
+                    if multi_run else source_path
+                )
+                metadata_path = zarr_path / "spectra.parquet"
+                if not metadata_path.is_file():
+                    continue
+                schema = set(pq.read_schema(metadata_path).names)
+                required = {"acquisition_num", "ms_level"}
+                if not required.issubset(schema):
+                    continue
+                metadata = pd.read_parquet(
+                    metadata_path, columns=["acquisition_num", "ms_level"]
+                )
+                ms2 = metadata.loc[
+                    metadata["ms_level"] == 2, "acquisition_num"
+                ]
+                if (
+                    len(ms2) > 0
+                    and ms2.notna().all()
+                    and ms2.is_unique
+                ):
+                    self._native_scan_runs.add(name)
+
+            self._updating_run_selector = True
+            try:
+                self.run_selector.options = reg.runs()
+                self.run_selector.value = run_id
+                self.run_selector.visible = len(reg.runs()) > 1
+            finally:
+                self._updating_run_selector = False
+
             self._iddata = IdentificationData(proteins, peptides)
+            self._run_id_index = run_identification_index(msms)
+            missing_runs = set(reg.runs()) - set(self._run_id_index)
+            if missing_runs:
+                raise ValueError(
+                    "No MaxQuant PSM support for registered run(s): "
+                    + ", ".join(sorted(missing_runs))
+                )
+            self._coverage_protein_row = None
+            self._coverage_highlight_peptide = None
+            self._coverage_mapping = None
+            self._coverage_sites = []
+            self.accession_selector.visible = False
 
             # modification sites for the sequence view (Stage 3): read all
             # *Sites.txt in the folder (oxidation, phospho, …). Authoritative
             # protein positions + localisation, generic over modification type.
             from ._mods_sites import ModificationSites
             self._mod_sites = ModificationSites(str(folder))
+            self._run_mod_site_ids = self._index_run_mod_sites(
+                msms, self._mod_sites.mod_types
+            )
 
             # optional FASTA for the coverage map (Stage 2)
             fasta_path = self.fasta_path.value.strip()
@@ -210,16 +474,40 @@ class IdsView:
             self.state.set("psms", psms)
             self.state.set("psm_run", run_id)
 
-            self.protein_table.value = self._iddata.protein_table.drop(columns="_gid")
+            self._updating_protein_table = True
+            try:
+                self.protein_search.value = ""
+                self.protein_table.selection = []
+                supported = self._run_id_index[run_id]["groups"]
+                self._displayed_protein_groups = (
+                    self._iddata.protein_table.loc[
+                        lambda df: df["_gid"].isin(supported)
+                    ].reset_index(drop=True).copy()
+                )
+                self.protein_table.value = (
+                    self._displayed_protein_groups.drop(columns="_gid")
+                    .reset_index(drop=True)
+                )
+            finally:
+                self._updating_protein_table = False
             self.peptide_table.value = self.peptide_table.value.iloc[0:0]
             n_groups = len(self._iddata.protein_table)
             fasta_note = (f" FASTA: {n_fasta} sequences (coverage map on)."
                           if self._fasta else " No FASTA (coverage map off).")
             self.status.object = (
                 f"✅ Loaded {len(psms)} PSMs, {n_groups} protein groups, "
-                f"spectra store ({len(store)} spectra, {'4D' if store.has_4d else '3D'}). "
-                f"1/K0 on {n_mob}; mods on {n_mod}.{fasta_note} "
+                f"{len(reg.runs())} spectra run(s) "
+                f"(first run: {len(store)} spectra, {'4D' if store.has_4d else '3D'}). "
+                f"1/K0 on {n_mob}; modification-site protein-group entries: "
+                f"{n_mod}.{fasta_note} "
                 f"Select a protein, then a peptide."
+                + (" Native Bruker precursor-ID associations available."
+                   if self._bruker_associations is not None
+                   else (
+                       " Exact native-scan matching available."
+                       if self._native_scan_runs
+                       else " Property-based spectrum matching."
+                   ))
                 + (f"  _(optional not found: {', '.join(opt_note)})_" if opt_note else ""))
         except Exception as e:
             self.status.object = f"❌ **Load failed:** {e}"
@@ -227,12 +515,52 @@ class IdsView:
             self.spectrum_panel.loading = False
 
     # ── selection: protein -> peptides -> spectrum ────────────────────────
+    def _on_protein_search(self, event=None):
+        """Filter displayed groups without modifying original MaxQuant data."""
+        if self._iddata is None or self._updating_protein_table:
+            return
+
+        supported = self._run_id_index.get(
+            self.run_selector.value, {}
+        ).get("groups", set())
+        source = self._iddata.protein_table.loc[
+            lambda df: df["_gid"].isin(supported)
+        ]
+        query = self.protein_search.value.strip()
+
+        if query:
+            mask = pd.Series(False, index=source.index)
+            for field in ("gene", "protein", "majority_ids"):
+                mask |= source[field].fillna("").astype(str).str.contains(
+                    query, case=False, regex=False
+                )
+            displayed = source.loc[mask].reset_index(drop=True).copy()
+        else:
+            displayed = source.reset_index(drop=True).copy()
+
+        self._updating_protein_table = True
+        try:
+            self.protein_table.selection = []
+            self._displayed_protein_groups = displayed
+            self.protein_table.value = (
+                displayed.drop(columns="_gid").reset_index(drop=True)
+            )
+        finally:
+            self._updating_protein_table = False
+
     async def _on_select_protein(self, event=None):
         sel = self.protein_table.selection
-        if not sel or self._iddata is None:
+        if (
+            self._updating_protein_table
+            or not sel
+            or self._iddata is None
+            or self._displayed_protein_groups is None
+        ):
             return
         row = int(sel[0])
-        prow = self._iddata.protein_table.iloc[row]
+        if not 0 <= row < len(self._displayed_protein_groups):
+            return
+        prow = self._displayed_protein_groups.iloc[row]
         gid = prow["_gid"]
         # show loading on the panels we're about to fill, and flush to the
         # browser before the (blocking) peptide filtering + FASTA mapping
@@ -245,38 +573,149 @@ class IdsView:
         self.info_panel.object = ""
         await asyncio.sleep(0.05)
         try:
-            self._pep_df = self._iddata.peptides_for_group(gid)
-            self.peptide_table.value = self._pep_df.drop(columns="_seq").reset_index(drop=True)
+            self._coverage_highlight_peptide = None
+            all_peptides = self._iddata.peptides_for_group(gid)
+            supported_sequences = self._run_id_index.get(
+                self.run_selector.value, {}
+            ).get("group_sequences", {}).get(str(gid), set())
+            self._pep_df = all_peptides.loc[
+                all_peptides["_seq"].isin(supported_sequences)
+            ].reset_index(drop=True).copy()
+            self.peptide_table.value = (
+                self._pep_df.drop(columns="_seq").reset_index(drop=True)
+            )
+            gene = str(prow.get("gene", "") or "").strip()
+            protein = str(prow.get("protein", "") or "").strip()
+            label = " | ".join(part for part in (gene, protein) if part)
+            self.peptide_heading.object = (
+                f"### Peptides - {label} "
+                f"({len(self._pep_df)} sequences with PSMs in selected run)"
+            )
             self._render_coverage(prow)        # coverage map (Stage 2) if FASTA loaded
         finally:
             self.peptide_table.loading = False
             self.coverage_panel.loading = False
 
+    @staticmethod
+    def _index_run_mod_sites(msms_path, mod_types):
+        """Index directly PSM-supported modification sites per raw run.
+
+        MaxQuant site IDs are scoped to each modification type. This index
+        does not imply run-specific localization probabilities.
+        """
+        import csv
+
+        index = {}
+        with open(msms_path, "r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter=chr(9))
+            columns = set(reader.fieldnames or [])
+            if "Raw file" not in columns:
+                raise ValueError("msms.txt lacks 'Raw file'")
+
+            site_columns = {
+                mod: f"{mod} site IDs"
+                for mod in mod_types
+                if f"{mod} site IDs" in columns
+            }
+
+            for row in reader:
+                run = (row.get("Raw file") or "").strip()
+                if not run:
+                    continue
+
+                run_index = index.setdefault(
+                    run, {mod: set() for mod in mod_types}
+                )
+                for mod, column in site_columns.items():
+                    for site_id in (row.get(column) or "").split(";"):
+                        site_id = site_id.strip()
+                        if site_id:
+                            run_index[mod].add(site_id)
+
+        return index
+
     def _render_coverage(self, protein_row):
-        """Draw the sequence coverage map for the selected protein group."""
-        self._coverage_mapping = None        # reset; set below only on success
+        """Configure majority-protein accessions for sequence coverage."""
+        self._coverage_protein_row = protein_row
+        self._coverage_mapping = None
+        self._coverage_sites = []
+
+        majority = str(protein_row.get("majority_ids", "") or "")
+        accessions = list(dict.fromkeys(
+            accession.strip()
+            for accession in majority.split(";")
+            if accession.strip()
+        ))
+
+        self._updating_accession_selector = True
+        try:
+            self.accession_selector.options = accessions
+            self.accession_selector.value = (
+                accessions[0] if accessions else None
+            )
+            self.accession_selector.visible = (
+                self._fasta is not None and len(accessions) > 1
+            )
+        finally:
+            self._updating_accession_selector = False
+
+        self._render_selected_coverage_accession()
+
+    def _on_select_coverage_accession(self, event=None):
+        """Recalculate the map when the selected accession changes."""
+        if not self._updating_accession_selector:
+            self._render_selected_coverage_accession()
+
+    def _render_selected_coverage_accession(self):
+        """Map peptides and verified sites onto the selected FASTA sequence."""
+        self._coverage_mapping = None
+        self._coverage_sites = []
+
         if self._fasta is None:
             self.coverage_panel[:] = [pn.pane.Markdown(
-                "_Load a FASTA to see the sequence coverage map._")]
+                "_Load a FASTA to see the sequence coverage map._"
+            )]
             return
-        from ._fasta import map_peptides
-        # leading majority protein id for this group
-        majority = protein_row.get("majority_ids", "") or ""
-        acc = majority.split(";")[0] if majority else ""
-        seq = self._fasta.get(acc) if acc else None
-        if not seq:
+
+        protein_row = self._coverage_protein_row
+        if protein_row is None or self._pep_df is None:
+            return
+
+        accession = self.accession_selector.value
+        sequence = self._fasta.get(accession) if accession else None
+
+        if not sequence:
             self.coverage_panel[:] = [pn.pane.Markdown(
-                f"⚠️ Protein `{acc or '?'}` not found in the FASTA — "
-                "is it the same database used in the search?")]
+                f"Protein accession `{accession or '?'}` is not present "
+                "in the loaded FASTA. Coverage and modification markers "
+                "cannot be displayed for this accession."
+            )]
             return
-        peps = self._pep_df[["peptide", "unique"]].to_dict("records")
-        mapping = map_peptides(acc, seq, peps)
-        self._coverage_mapping = mapping        # keep for peptide-click highlight
-        # modification sites for this group (Stage 3), positions valid for this protein
-        gid = protein_row["_gid"]
-        self._coverage_sites = (self._mod_sites.for_group(gid)
-                                if self._mod_sites is not None else [])
-        self._show_coverage(mapping, highlight_peptide=None)
+
+        from ._fasta import map_peptides
+
+        peptides = self._pep_df[["peptide", "unique"]].to_dict("records")
+        mapping = map_peptides(accession, sequence, peptides)
+        self._coverage_mapping = mapping
+
+        gid = str(protein_row["_gid"])
+        self._coverage_sites = (
+            self._mod_sites.for_group_accession(
+                gid,
+                accession,
+                sequence,
+                supported_site_ids=self._run_mod_site_ids.get(
+                    self.run_selector.value, {}
+                ),
+            )
+            if self._mod_sites is not None else []
+        )
+
+        self._show_coverage(
+            mapping,
+            highlight_peptide=self._coverage_highlight_peptide,
+        )
+
 
     def _show_coverage(self, mapping, highlight_peptide=None):
         """Render the coverage panel; optionally outline one peptide's residues.
@@ -296,7 +735,10 @@ class IdsView:
             mods = sorted({s["mod"] for s in sites})
             note += (f"  \n_Modification sites marked below the sequence "
                      f"({', '.join(mods)}): **solid** = localisation ≥ 0.75, "
-                     f"**hollow** = below 0.75 (uncertain). Hover a marker for details._")
+                     f"**hollow** = below 0.75 (uncertain). "
+                     f"Markers require direct PSM support in the selected run; "
+                     f"localization probabilities are combined MaxQuant values. "
+                     f"Hover a marker for details._")
         if highlight_peptide:
             note += f"  \n_Outlined in red: **{highlight_peptide}**._"
         self.coverage_panel[:] = [
@@ -388,16 +830,59 @@ class IdsView:
             'padding:8px;border:1px solid #e0e0e0;border-radius:4px;background:#fafafa;">'
             f'{legend}{body}</div>')
 
+    def _on_select_run(self, event=None):
+        if self._updating_run_selector:
+            return
+        run_id = self.run_selector.value
+        if not run_id or not hasattr(self, "_registry"):
+            return
+        store = self._registry.get(run_id)
+        self.state.set("id_store", store)
+        self.state.set("psm_run", run_id)
+        self._match = None
+        self._last_spectrum = None
+        self._xic_request = None
+        self.xic_button.disabled = True
+        self.xic_panel[:] = []
+        self.info_panel.object = ""
+        self.bruker_spectrum_selector.visible = False
+        self.bruker_association_note.visible = False
+        self.spectrum_panel[:] = [
+            pn.pane.Markdown(
+                "_Select a peptide to inspect its spectrum in the selected run._"
+            )
+        ]
+        self.peptide_table.selection = []
+        self._pep_df = None
+        self.peptide_table.value = self.peptide_table.value.iloc[0:0]
+        self.peptide_heading.object = (
+            "### Peptides - direct PSM support in selected run"
+        )
+        self._coverage_mapping = None
+        self._coverage_protein_row = None
+        self._coverage_highlight_peptide = None
+        self._coverage_sites = []
+        self.accession_selector.visible = False
+        self.coverage_panel[:] = [
+            pn.pane.Markdown("_Select a protein to see its sequence coverage._")
+        ]
+        self._on_protein_search()
+
     async def _on_select_peptide(self, event=None):
+        self._xic_request = None
+        self.xic_button.disabled = True
+        self.xic_panel[:] = []
         sel = self.peptide_table.selection
         if not sel or self._pep_df is None:
             return
         row = int(sel[0])
         seq = self._pep_df.iloc[row]["_seq"]
         # outline this peptide on the coverage sequence (if a map is shown)
+        self._coverage_highlight_peptide = seq
         if getattr(self, "_coverage_mapping", None) is not None:
             self._show_coverage(self._coverage_mapping, highlight_peptide=seq)
-        psm = self._psm_by_seq.get(seq)
+        run_id = self.run_selector.value
+        psm = self._psm_by_seq.get((seq, run_id))
         if psm is None:
             self.spectrum_panel[:] = [pn.pane.Markdown(
                 f"⚠️ No PSM found in msms.txt for peptide `{seq}` "
@@ -408,15 +893,115 @@ class IdsView:
         await asyncio.sleep(0.05)
         try:
             from .. import ids
-            match = ids.spectrum_for_psm(psm, self._registry)
-            self._match = match
-            self._render_spectrum(psm, match)
-            self._render_xic(psm, match)
-            self._render_info(psm, match)
+            if self._bruker_associations is not None:
+                indices = self._bruker_associations.spectrum_indices_for_psm(psm)
+                self._bruker_selected_psm = psm
+                self._bruker_spectrum_indices = indices
+
+                options = {
+                    f"MS2 spectrum {index} ({position}/{len(indices)})": index
+                    for position, index in enumerate(indices, 1)
+                }
+                self._updating_bruker_selector = True
+                try:
+                    self.bruker_spectrum_selector.options = options
+                    self.bruker_spectrum_selector.value = (
+                        indices[0] if indices else None
+                    )
+                    self.bruker_spectrum_selector.visible = bool(indices)
+                finally:
+                    self._updating_bruker_selector = False
+
+                if len(indices) > 1:
+                    self.bruker_association_note.object = (
+                        f"**{len(indices)} native Bruker MS2 associations.** "
+                        "Select an individual acquisition to inspect. "
+                        "These associations do not establish that every "
+                        "acquisition contributed to the accumulated "
+                        "MaxQuant searched spectrum."
+                    )
+                elif indices:
+                    self.bruker_association_note.object = (
+                        "**1 native Bruker MS2 association.**"
+                    )
+                else:
+                    self.bruker_association_note.object = (
+                        "No native Bruker MS2 association for this PSM."
+                    )
+                self.bruker_association_note.visible = True
+
+                self._render_selected_bruker_spectrum()
+            else:
+                self._bruker_selected_psm = None
+                self._bruker_spectrum_indices = ()
+                self.bruker_spectrum_selector.visible = False
+                self.bruker_association_note.visible = False
+
+                if psm.run in self._native_scan_runs:
+                    match = ids.spectrum_for_native_scan(
+                        psm, self._registry
+                    )
+                else:
+                    match = ids.spectrum_for_psm(psm, self._registry)
+                self._match = match
+                self._render_spectrum(psm, match)
+                self._prepare_xic(psm, match)
+                self._render_info(psm, match)
         except Exception as e:
             self.spectrum_panel[:] = [pn.pane.Markdown(f"❌ **Annotation error:** {e}")]
         finally:
             self.spectrum_panel.loading = False
+
+    def _on_select_bruker_spectrum(self, event=None):
+        """Render an explicitly selected native Bruker MS2 association."""
+        if self._updating_bruker_selector:
+            return
+        if self._bruker_associations is None:
+            return
+        if self._bruker_selected_psm is None:
+            return
+        if self.bruker_spectrum_selector.value not in self._bruker_spectrum_indices:
+            return
+        self._render_selected_bruker_spectrum()
+
+    def _render_selected_bruker_spectrum(self):
+        """Display one association without discarding the other candidates."""
+        from .. import ids
+
+        psm = self._bruker_selected_psm
+        index = self.bruker_spectrum_selector.value
+        indices = self._bruker_spectrum_indices
+
+        if psm is None or index not in indices:
+            self._match = None
+            self._last_spectrum = None
+            self.spectrum_panel[:] = [
+                pn.pane.Markdown(
+                    "No associated Bruker MS2 spectrum is selected."
+                )
+            ]
+            self.xic_panel[:] = []
+            return
+
+        run = self._registry.get(psm.run)
+        spectrum = run[int(index)]
+
+        candidates = pd.DataFrame({
+            "store_index": list(indices),
+        })
+
+        match = ids.PsmMatch(
+            psm=psm,
+            store_index=int(index),
+            spectrum=spectrum,
+            candidates=candidates,
+            method="bruker-precursor-id-association",
+        )
+
+        self._match = match
+        self._render_spectrum(psm, match)
+        self._prepare_xic(psm, match)
+        self._render_info(psm, match)
 
     def _render_spectrum(self, psm, match):
         if not match.resolved or match.spectrum is None:
@@ -497,10 +1082,30 @@ class IdsView:
         self.spectrum_panel[0] = pn.pane.HoloViews(
             self._spectrum_overlay(), sizing_mode="stretch_width")
 
+    def _prepare_xic(self, psm, match):
+        """Offer XIC extraction without blocking spectrum selection."""
+        self._xic_request = (psm, match)
+        self.xic_button.disabled = (
+            self.state.id_store is None
+            or psm.precursor_mz is None
+            or psm.retention_time is None
+        )
+        self.xic_panel[:] = [pn.pane.Markdown(
+            "_XIC not calculated. Click Generate precursor XIC "
+            "to extract it for this peptide._"
+        )]
+
+    def _on_generate_xic(self, event=None):
+        """Run the existing XIC algorithm only when requested."""
+        if self._xic_request is None:
+            return
+        psm, match = self._xic_request
+        self._render_xic(psm, match)
+
     def _render_xic(self, psm, match):
         """Windowed XIC: the PSM's precursor m/z over a narrow RT window — the
         'raw data' context of where this identification elutes."""
-        store = self.state.id_store
+        store = self._registry.get(psm.run)
         if store is None or psm.precursor_mz is None or psm.retention_time is None:
             self.xic_panel[:] = []
             return
@@ -526,37 +1131,38 @@ class IdsView:
         except Exception as e:
             self.xic_panel[:] = [pn.pane.Markdown(f"_XIC unavailable: {e}_")]
 
-        def _render_info(self, psm, match):
-            pep = psm.peptidoform
-            from .. import ids
+    def _render_info(self, psm, match):
+        pep = psm.peptidoform
+        from .. import ids
 
-            cov = None
-            if match.resolved and match.spectrum is not None:
-                sp = match.spectrum
-                r = ids.match_fragments(
-                    np.asarray(sp.mz([0])[0], float),
-                    pep.proforma,
-                    pep.precursor_charge,
-            )
-                cov = f"{r['matched_ions']} ions, coverage {r['coverage']}/{r['max_coverage']}"
+        cov = None
+        if match.resolved and match.spectrum is not None:
+            sp = match.spectrum
+            r = ids.match_fragments(
+                np.asarray(sp.mz([0])[0], float),
+                pep.proforma,
+                pep.precursor_charge,
+        )
+            cov = f"{r['matched_ions']} ions, coverage {r['coverage']}/{r['max_coverage']}"
 
-            rows = [
-                f"**Peptide:** `{pep.proforma}`",
-                f"**Charge:** {pep.precursor_charge}",
-                f"**Precursor m/z:** {psm.precursor_mz:.4f}" if psm.precursor_mz else "",
-                f"**RT:** {psm.retention_time:.3f} min" if psm.retention_time is not None else "",
-                f"**1/K0:** {psm.ion_mobility:.4f}" if psm.ion_mobility is not None else "**1/K0:** —",
-                f"**Match method:** `{match.method}` ({match.n_candidates} candidate(s))",
-                f"**Fragments:** {cov}" if cov else "",
-            ]
-            self.info_panel.object = "  \n".join(r for r in rows if r)
+        rows = [
+            f"**Peptide:** `{pep.proforma}`",
+            f"**Charge:** {pep.precursor_charge}",
+            f"**Precursor m/z:** {psm.precursor_mz:.4f}" if psm.precursor_mz else "",
+            f"**RT:** {psm.retention_time:.3f} min" if psm.retention_time is not None else "",
+            f"**1/K0:** {psm.ion_mobility:.4f}" if psm.ion_mobility is not None else "**1/K0:** —",
+            f"**Match method:** `{match.method}` ({match.n_candidates} candidate(s))",
+            f"**Fragments:** {cov}" if cov else "",
+        ]
+        self.info_panel.object = "  \n".join(r for r in rows if r)
 
     # ── layout ─────────────────────────────────────────────────────────────
     def view(self):
         from ._browse import browse_field
         inputs = pn.Column(
             pn.pane.Markdown("## Identifications"),
-            browse_field(self.store_path, patterns=["*.zarr", "*.mzML", "*.mzXML"], width=560),
+            self.dataset_source,
+            browse_field(self.store_path, patterns=["*.zarr"], width=560),
             browse_field(self.txt_dir, pick_folder=True, width=560),
             browse_field(self.fasta_path, patterns=["*.fasta", "*.fa"], width=560),
             pn.Row(self.load_btn),
@@ -565,17 +1171,32 @@ class IdsView:
         return pn.Column(
             inputs,
             pn.layout.Divider(),
-            pn.pane.Markdown("### Proteins"),
+            pn.pane.Markdown("### Explore identifications"),
+            self.run_selector,
+            pn.pane.Markdown(
+                "### Proteins - direct PSM support in selected run"
+            ),
+            pn.pane.Markdown(
+                "_Protein scores, counts and coverage percentages shown below "
+                "are from the combined MaxQuant proteinGroups.txt results; "
+                "they are not recalculated per run._"
+            ),
+            self.protein_search,
             self.protein_table,
             pn.pane.Markdown("### Sequence coverage"),
+            self.accession_selector,
             self.coverage_panel,
             pn.layout.Divider(),
             pn.Row(
-                pn.Column(pn.pane.Markdown("### Peptides"),
-                          self.peptide_table, self.info_panel, width=580),
+                pn.Column(self.peptide_heading,
+                          self.peptide_table, self.info_panel,
+                          width=660, min_width=660),
                 pn.Column(pn.pane.Markdown("### Annotated spectrum"),
+                          self.bruker_spectrum_selector,
+                          self.bruker_association_note,
                           pn.Row(self.annotated_only, height=34, sizing_mode="stretch_width"),
-                          self.spectrum_panel, self.xic_panel, sizing_mode="stretch_width"),
+                          self.spectrum_panel, self.xic_button,
+                          self.xic_panel, sizing_mode="stretch_width"),
                 sizing_mode="stretch_width"),
             sizing_mode="stretch_width")
 

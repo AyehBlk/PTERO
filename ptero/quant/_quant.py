@@ -80,9 +80,11 @@ class QuantData:
     Attributes
     ----------
     lfq, intensity : DataFrame
-        protein x sample. ``lfq`` is MaxLFQ-normalised (the display / comparison
-        basis); ``intensity`` is raw summed intensity (kept for the three-way
-        missingness distinction). ``NaN`` == not quantified in that sample.
+        Protein x sample. ``lfq`` is the active quantification matrix:
+        MaxLFQ-normalised values when quantity='lfq', or raw summed
+        intensities when quantity='intensity'. ``intensity`` contains raw
+        summed intensities; with the Intensity fallback, both matrices
+        contain the same values. ``NaN`` means not quantified in that sample.
     id_type : DataFrame
         protein x sample MaxQuant identification provenance: ``"By MS/MS"`` (a
         real MS/MS ID in that sample), ``"By matching"`` (match-between-runs

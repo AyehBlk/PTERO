@@ -21,6 +21,8 @@ an imputed track is trustworthy or whether to report complete-case.
 """
 from __future__ import annotations
 
+from io import BytesIO, StringIO
+
 import numpy as np
 import pandas as pd
 import panel as pn
@@ -72,7 +74,7 @@ class DeView:
         self.ref_group = pn.widgets.Select(name="Reference group (baseline)", options=[], width=220)
         self.on_min = pn.widgets.IntInput(name="on/off: min present in a group", value=4, start=1, width=210)
         self.run_btn = pn.widgets.Button(
-            name="Run differential expression", button_type="success", width=250, disabled=True)
+            name="Run differential abundance", button_type="success", width=250, disabled=True)
         self.group_panel = pn.Column(visible=False, sizing_mode="stretch_width")
 
         # ── analysis controls (Apply-driven) ──
@@ -89,10 +91,26 @@ class DeView:
         self.detmat_pane = pn.pane.Matplotlib(tight=True, height=520)
         self.heat_pane = pn.pane.Matplotlib(tight=True, height=620)
         self.box_pane = pn.pane.Matplotlib(tight=True, height=420)
+        self.protein_search = pn.widgets.TextInput(
+            name="Search proteins",
+            placeholder="Gene, protein name, or protein ID", width=460)
+        self._all_result_rows = pd.DataFrame()
         self.results_table = pn.widgets.Tabulator(
             pd.DataFrame(columns=["label", "log2FC", "p", "padj"]),
             selectable=1, disabled=True, height=360, width=520, pagination="local",
             page_size=15, show_index=False, hidden_columns=["id"], widths={"label": 150})
+        self.export_csv = pn.widgets.FileDownload(
+            callback=lambda: self._export_results(","),
+            filename="ptero_de_results.csv",
+            label="Download CSV",
+            button_type="primary",
+            disabled=True)
+        self.export_tsv = pn.widgets.FileDownload(
+            callback=lambda: self._export_results(chr(9)),
+            filename="ptero_de_results.tsv",
+            label="Download TSV",
+            button_type="default",
+            disabled=True)
         self.summary = pn.pane.Markdown("")
         self.results_panel = pn.Column(visible=False, sizing_mode="stretch_width")
 
@@ -105,13 +123,42 @@ class DeView:
             selectable=1, disabled=True, height=360, width=620, pagination="local",
             page_size=15, show_index=False, hidden_columns=["id"], widths={"label": 130, "mechanism": 150})
         self.impute_box_pane = pn.pane.Matplotlib(tight=True, height=420)
+        self.download_volcano = pn.widgets.FileDownload(
+            callback=lambda pane=self.volcano_pane: self._export_figure(pane),
+            filename="ptero_de_volcano.png",
+            label="Download PNG", disabled=True)
+        self.download_detection = pn.widgets.FileDownload(
+            callback=lambda pane=self.detmat_pane: self._export_figure(pane),
+            filename="ptero_de_detection.png",
+            label="Download PNG", disabled=True)
+        self.download_heatmap = pn.widgets.FileDownload(
+            callback=lambda pane=self.heat_pane: self._export_figure(pane),
+            filename="ptero_de_heatmap.png",
+            label="Download PNG", disabled=True)
+        self.download_protein = pn.widgets.FileDownload(
+            callback=lambda pane=self.box_pane: self._export_figure(pane),
+            filename="ptero_de_protein.png",
+            label="Download PNG", disabled=True)
+        self.download_imputation_distribution = pn.widgets.FileDownload(
+            callback=lambda pane=self.impute_dist_pane: self._export_figure(pane),
+            filename="ptero_de_imputation_distribution.png",
+            label="Download PNG", disabled=True)
+        self.download_imputation_protein = pn.widgets.FileDownload(
+            callback=lambda pane=self.impute_box_pane: self._export_figure(pane),
+            filename="ptero_de_imputation_protein.png",
+            label="Download PNG", disabled=True)
 
         # ── wiring ──
         self.load_btn.on_click(self._on_load)
         self.run_btn.on_click(self._on_run)
         self.apply_btn.on_click(self._refresh)
         self.group_table.param.watch(self._refresh_ref_options, "value")
+        self.ref_group.param.watch(self._invalidate_analysis, "value")
+        self.on_min.param.watch(self._invalidate_analysis, "value")
+        self.pg_path.param.watch(self._invalidate_analysis, "value")
+        self.quantity.param.watch(self._invalidate_analysis, "value")
         self.results_table.param.watch(self._on_select_row, "selection")
+        self.protein_search.param.watch(self._on_protein_search, "value")
         self.newhits_table.param.watch(self._on_select_newhit, "selection")
 
     # ── loading ──────────────────────────────────────────────────────────
@@ -135,17 +182,56 @@ class DeView:
             self.status.object = ("\u274c No sample columns found for that quantity. "
                                   "If LFQ wasn't enabled in MaxQuant, try Quantity = Intensity.")
             return
-        sugg = suggest_groups_by_token(names)
+        try:
+            sugg = suggest_groups_by_token(names)
+        except ValueError:
+            sugg = {}
         self.group_table.value = pd.DataFrame(
-            {"sample": names, "group": [str(sugg.get(s, "A")) for s in names]})
+            {"sample": names, "group": [str(sugg.get(s, "")) for s in names]})
         self._refresh_ref_options()
         self.group_panel.visible = True
         self.results_panel.visible = False
         self.run_btn.disabled = False
-        self.status.object = (f"\u2705 Loaded **{len(names)}** samples. Edit the **group** column if "
-                              "needed, pick the reference group, then Run.")
+        if not sugg:
+            self.status.object = (
+                f"Loaded **{len(names)}** samples. Automatic grouping was not "
+                "possible; assign a group to every sample before running.")
+        else:
+            self.status.object = (f"\u2705 Loaded **{len(names)}** samples. Edit the **group** column if "
+                                  "needed, pick the reference group, then Run.")
+
+    def _invalidate_analysis(self, event=None):
+        if self._results is None and self._qd is None:
+            return
+        self._qd = None
+        self._diag = None
+        self._pa = None
+        self._results = None
+        self._primary = None
+        self._M = None
+        self._mcache = {}
+        self._selected = None
+        self.results_panel.visible = False
+        self.export_csv.disabled = True
+        self.export_tsv.disabled = True
+        for pane in (
+            self.volcano_pane,
+            self.detmat_pane,
+            self.heat_pane,
+            self.box_pane,
+            self.impute_dist_pane,
+            self.impute_box_pane,
+        ):
+            pane.object = None
+        self._sync_figure_downloads()
+        self.state.set("quant", None)
+        self.status.object = (
+            "**Analysis inputs changed.** Run differential abundance again "
+            "before interpreting results."
+        )
 
     def _refresh_ref_options(self, event=None):
+        self._invalidate_analysis()
         df = self.group_table.value
         groups = list(dict.fromkeys(df["group"].astype(str))) if len(df) else []
         self.ref_group.options = groups
@@ -160,9 +246,20 @@ class DeView:
         gdf = self.group_table.value
         groups = {str(s): str(g) for s, g in zip(gdf["sample"], gdf["group"])}
         uniq = list(dict.fromkeys(groups.values()))
+        if any(not g.strip() for g in groups.values()):
+            self.status.object = (
+                "Assign a non-empty group to every sample before running.")
+            return
         if len(uniq) != 2:
             self.status.object = (f"\u274c This test needs exactly **2** groups; you have {uniq}. "
                                   "Edit the group column so there are two.")
+            return
+        counts = {g: list(groups.values()).count(g) for g in uniq}
+        if any(n < 2 for n in counts.values()):
+            self.status.object = (
+                "Differential abundance testing requires at least 2 independent "
+                f"samples per group; current group sizes: {counts}. "
+                "Technical injections are not independent biological replicates.")
             return
         ref = self.ref_group.value
         if ref not in uniq:
@@ -238,10 +335,65 @@ class DeView:
             title=f"Top {int(self.heat_top.value)} proteins  ({self.method.value})")
 
     # ── main refresh (Apply) ─────────────────────────────────────────────
+    @staticmethod
+    def _export_figure(pane):
+        """Export the displayed Matplotlib figure at 300 DPI."""
+        fig = pane.object
+        if fig is None:
+            raise ValueError("Plot not available yet.")
+        output = BytesIO()
+        fig.savefig(output, format="png", dpi=300, bbox_inches="tight")
+        output.seek(0)
+        return output
+
+    def _sync_figure_downloads(self):
+        for name, pane in (
+            ("volcano", self.volcano_pane),
+            ("detection", self.detmat_pane),
+            ("heatmap", self.heat_pane),
+            ("protein", self.box_pane),
+            ("imputation_distribution", self.impute_dist_pane),
+            ("imputation_protein", self.impute_box_pane),
+        ):
+            getattr(self, "download_" + name).disabled = pane.object is None
+
+    def _export_results(self, sep):
+        """Export full-precision results for the selected method and track."""
+        if self._results is None:
+            raise ValueError("Run differential abundance before exporting.")
+
+        sub, track = self._current()
+        df = sub.reset_index()[
+            ["id", "label", "log2FC", "AveExpr", "p", "padj"]
+        ].copy()
+
+        df.insert(2, "contrast", sub.attrs["contrast"])
+        df.insert(3, "method", self.method.value)
+        df.insert(4, "track", track)
+
+        alpha = float(self.alpha.value)
+        lfc = float(self.lfc.value)
+
+        df["padj_threshold"] = alpha
+        df["abs_log2fc_threshold"] = lfc
+        df["significant"] = (
+            (df["padj"] < alpha)
+            & (df["log2FC"].abs() >= lfc)
+        )
+
+        output = StringIO()
+        df.to_csv(
+            output, sep=sep, index=False, float_format="%.17g"
+        )
+        output.seek(0)
+        return output
+
     def _refresh(self, event=None):
         if self._results is None:
             return
         sub, track = self._current()
+        self.export_csv.disabled = False
+        self.export_tsv.disabled = False
         self._primary = sub
         self._M = self._mcache[track][0]
         self._selected = None
@@ -256,12 +408,21 @@ class DeView:
         tab["log2FC"] = tab["log2FC"].round(3)
         tab["p"] = tab["p"].map(lambda v: float(f"{v:.3g}"))
         tab["padj"] = tab["padj"].round(4)
-        self.results_table.value = tab
-        nsig = int((sub["padj"] < a).sum())
+        self._all_result_rows = tab
+        self._filter_result_rows()
+        nsig = int(((sub["padj"] < a) & (sub["log2FC"].abs() >= l)).sum())
+        caution = (
+            "  \n**Interpretation caution:** This track includes imputed intensities. "
+            "Adjusted p-values do not account for imputation uncertainty; "
+            "compare against complete-case and alternative-imputation results "
+            "before interpreting significance."
+            if track != "complete_case" else ""
+        )
         self.summary.object = (f"**{nsig}** significant at padj < {a:g} and |log2FC| \u2265 {l:g}"
                                f"  \u00b7  {len(sub)} proteins tested  \u00b7  contrast "
-                               f"`{sub.attrs['contrast']}`")
+                               f"`{sub.attrs['contrast']}`" + caution)
         self._build_newhits(track)
+        self._sync_figure_downloads()
 
     # ── selection -> boxplot + linked highlight ──────────────────────────
     def _select(self, pid, box_pane):
@@ -276,6 +437,25 @@ class DeView:
             imputed_mask=imputed_mask)
         self._render_volcano(highlight=pid)
         self._render_heatmap(highlight=pid)
+        self._sync_figure_downloads()
+
+    def _filter_result_rows(self):
+        query = self.protein_search.value.strip()
+        source = self._all_result_rows
+        if query:
+            mask = (
+                source["label"].fillna("").astype(str).str.contains(
+                    query, case=False, regex=False)
+                | source["id"].astype(str).str.contains(
+                    query, case=False, regex=False)
+            )
+            source = source.loc[mask]
+        self.results_table.selection = []
+        self.results_table.value = source.reset_index(drop=True).copy()
+
+    def _on_protein_search(self, event=None):
+        if self._results is not None:
+            self._filter_result_rows()
 
     def _on_select_row(self, event=None):
         sel = self.results_table.selection
@@ -381,10 +561,12 @@ class DeView:
         if len(df):
             df = df.sort_values("p").reset_index(drop=True)
         self.newhits_table.value = df
-        n_sig = int((df["padj"] < a).sum()) if len(df) else 0
+        l = float(self.lfc.value)
+        n_sig = int(((df["padj"] < a) & (df["log2FC"].abs() >= l)).sum()) if len(df) else 0
         self.newhits_note.object = (
             f"**{len(df)}** proteins are testable only because of imputation (they had missing "
-            f"values) on this track; **{n_sig}** reach padj < {a:g}. Ranked by p \u2014 click a row to "
+            f"values) on this track; **{n_sig}** meet padj < {a:g} and "
+            f"|log2FC| >= {l:g}. Ranked by p \u2014 click a row to "
             f"see its boxplot with **imputed values drawn as hollow rings**, so you can judge whether "
             f"the signal is real or an imputation artifact.")
 
@@ -393,7 +575,7 @@ class DeView:
         from ._browse import browse_field
 
         load_block = pn.Column(
-            pn.pane.Markdown("## Differential expression"),
+            pn.pane.Markdown("## Differential Protein Abundance"),
             browse_field(self.pg_path, patterns=["*.txt"], width=560),
             pn.Row(self.quantity, pn.Column(pn.Spacer(height=18), self.load_btn)),
             self.status,
@@ -418,10 +600,11 @@ class DeView:
                              "proteins that are only testable because of imputation."),
             self.impute_summary,
             self.impute_dist_pane,
+            self.download_imputation_distribution,
             pn.layout.Divider(),
             self.newhits_note,
             pn.Row(self.newhits_table,
-                   pn.Column(pn.pane.Markdown("**Recovered-protein detail**"), self.impute_box_pane)),
+                   pn.Column(pn.pane.Markdown("**Recovered-protein detail**"), self.impute_box_pane, self.download_imputation_protein)),
             title="Imputation analysis  \u2014  is imputing a good idea for your data?",
             collapsed=True, sizing_mode="stretch_width")
 
@@ -430,15 +613,17 @@ class DeView:
             controls,
             self.summary,
             pn.Row(
-                pn.Column(pn.pane.Markdown("### Volcano"), self.volcano_pane, sizing_mode="stretch_width"),
-                pn.Column(pn.pane.Markdown("### On/off detection"), self.detmat_pane),
+                pn.Column(pn.pane.Markdown("### Volcano"), self.volcano_pane, self.download_volcano, sizing_mode="stretch_width"),
+                pn.Column(pn.pane.Markdown("### On/off detection"), self.detmat_pane, self.download_detection),
                 sizing_mode="stretch_width"),
             pn.layout.Divider(),
             pn.Row(
-                pn.Column(pn.pane.Markdown("### Top proteins"), self.heat_pane),
+                pn.Column(pn.pane.Markdown("### Top proteins"), self.heat_pane, self.download_heatmap),
                 pn.Column(pn.pane.Markdown("### Results \u2014 select a row for its boxplot"),
+                          self.protein_search,
+                          pn.Row(self.export_csv, self.export_tsv),
                           self.results_table,
-                          pn.pane.Markdown("### Protein detail"), self.box_pane)),
+                          pn.pane.Markdown("### Protein detail"), self.box_pane, self.download_protein)),
             pn.layout.Divider(),
             impute_card,
         ]

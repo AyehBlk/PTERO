@@ -38,6 +38,10 @@ class AppState:
 
     def __init__(self) -> None:
         self.raw_store = None
+        # Registered PTERO Datasets: display name -> absolute store path.
+        self.raw_datasets: dict[str, str] = {}
+        # Active Raw Data sample name; the open object is raw_store.
+        self.raw_sample: Optional[str] = None
         self.quant = None            # QuantData loaded on the differential-expression page, or None
         self.id_store = None
         self.psms = None

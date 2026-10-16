@@ -78,10 +78,12 @@ class ModificationSites:
                     return cols[n.lower()]
             return None
 
+        c_proteins = col("Proteins")
         c_pos = col("Positions within proteins", "Position")
         c_res = col("Amino acid")
         c_loc = col("Localization prob")
         c_grp = col("Protein group IDs")
+        c_id = col("id")
         c_rev = col("Reverse")
         c_con = col("Potential contaminant")
         if c_pos is None or c_grp is None:
@@ -100,11 +102,28 @@ class ModificationSites:
                 position = int(float(pos))
             except (ValueError, TypeError):
                 continue
+            protein_positions = {}
+            if c_proteins:
+                accessions = [v.strip() for v in r[c_proteins].split(";")]
+                positions = [v.strip() for v in r[c_pos].split(";")]
+                if len(accessions) == len(positions):
+                    for accession, value in zip(accessions, positions):
+                        if not accession or not value:
+                            continue
+                        try:
+                            site_position = int(value)
+                        except ValueError:
+                            continue
+                        if site_position > 0:
+                            protein_positions[accession] = site_position
+
             site = {
                 "mod": mod_name,
-                "position": position,                       # 1-based protein position
+                "site_id": r[c_id].strip() if c_id else None,
+                "position": position,                       # legacy leading position
                 "residue": r[c_res] if c_res else "",
                 "localization": _to_float(r[c_loc]) if c_loc else float("nan"),
+                "protein_positions": protein_positions,
             }
             # a site row can belong to several groups (';'-separated)
             groups = (r[c_grp].split(";") if c_grp else [])
@@ -116,6 +135,38 @@ class ModificationSites:
     def for_group(self, gid: str) -> list[dict]:
         """Modification sites for protein-group *gid* (may be empty)."""
         return self.by_group.get(gid, [])
+
+    def for_group_accession(
+        self,
+        gid: str,
+        accession: str,
+        sequence: str,
+        supported_site_ids: dict[str, set[str]] | None = None,
+    ) -> list[dict]:
+        """Sites explicitly assigned to an accession and verified against FASTA.
+
+        Missing accession-position associations and residue mismatches are
+        excluded rather than transferring coordinates from another protein.
+        """
+        result = []
+        for site in self.for_group(gid):
+            if supported_site_ids is not None:
+                site_id = site.get("site_id")
+                if not site_id or site_id not in supported_site_ids.get(
+                    site["mod"], set()
+                ):
+                    continue
+            position = site.get("protein_positions", {}).get(accession)
+            if position is None or not 1 <= position <= len(sequence):
+                continue
+            if sequence[position - 1] != site["residue"]:
+                continue
+            result.append({
+                **site,
+                "position": position,
+                "accession": accession,
+            })
+        return result
 
     def __len__(self):
         return sum(len(v) for v in self.by_group.values())

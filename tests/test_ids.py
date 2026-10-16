@@ -341,3 +341,104 @@ def test_read_search_modifications_rejects_unsupported_terminal_fixed_mod(tmp_pa
 
     with pytest.raises(ValueError, match="fixed modification"):
         ids.read_search_modifications(tmp_path / "summary.txt")
+
+def test_bruker_associations_preserve_multiple_spectra(tmp_path):
+    """Exact precursor IDs retain all associated MS2 acquisition spectra."""
+    import pandas as pd
+    from types import SimpleNamespace
+    from ptero.ids import BrukerPsmAssociations
+
+    accumulated = tmp_path / "accumulatedMsmsScans.txt"
+    accumulated.write_text(
+        "Raw file\tScan number\tPASEF precursor IDs\n"
+        "sample\t10\t101;102\n"
+        "sample\t11\t103\n",
+        encoding="utf-8-sig",
+    )
+
+    metadata = pd.DataFrame({
+        "scan_index": [0, 1, 2, 3, 4],
+        "ms_level": [1, 2, 2, 2, 2],
+        "bruker_precursor_id": pd.array(
+            [pd.NA, 101, 101, 102, 103], dtype="Int64"
+        ),
+    })
+
+    linker = BrukerPsmAssociations(accumulated, metadata)
+
+    psm = SimpleNamespace(run="sample", spectrum_id="10")
+
+    assert linker.precursor_ids_for_psm(psm) == (101, 102)
+    assert linker.spectrum_indices_for_psm(psm) == (1, 2, 3)
+
+    other = SimpleNamespace(run="sample.d", spectrum_id="11")
+    assert linker.spectrum_indices_for_psm(other) == (4,)
+
+
+def test_bruker_associations_reject_duplicate_scan_keys(tmp_path):
+    """Ambiguous MaxQuant scan keys must never be silently overwritten."""
+    import pandas as pd
+    import pytest
+    from ptero.ids import BrukerPsmAssociations
+
+    accumulated = tmp_path / "accumulatedMsmsScans.txt"
+    accumulated.write_text(
+        "Raw file\tScan number\tPASEF precursor IDs\n"
+        "sample\t10\t101\n"
+        "sample\t10\t102\n",
+        encoding="utf-8",
+    )
+
+    metadata = pd.DataFrame({
+        "scan_index": [0],
+        "ms_level": [2],
+        "bruker_precursor_id": pd.array([101], dtype="Int64"),
+    })
+
+    with pytest.raises(ValueError, match="Duplicate accumulated scan key"):
+        BrukerPsmAssociations(accumulated, metadata)
+
+
+def test_bruker_associations_reject_missing_native_metadata(tmp_path):
+    """Legacy non-Bruker stores cannot be mistaken for native-ID stores."""
+    import pandas as pd
+    import pytest
+    from ptero.ids import BrukerPsmAssociations
+
+    accumulated = tmp_path / "accumulatedMsmsScans.txt"
+    accumulated.write_text(
+        "Raw file\tScan number\tPASEF precursor IDs\n"
+        "sample\t10\t101\n",
+        encoding="utf-8",
+    )
+
+    metadata = pd.DataFrame({
+        "scan_index": [0],
+        "ms_level": [2],
+    })
+
+    with pytest.raises(KeyError, match="bruker_precursor_id"):
+        BrukerPsmAssociations(accumulated, metadata)
+
+
+def test_bruker_associations_reject_repeated_precursor_ids(tmp_path):
+    """Repeated IDs in one MaxQuant contributor list are invalid."""
+    import pandas as pd
+    import pytest
+    from ptero.ids import BrukerPsmAssociations
+
+    accumulated = tmp_path / "accumulatedMsmsScans.txt"
+    accumulated.write_text(
+        "Raw file\tScan number\tPASEF precursor IDs\n"
+        "sample\t10\t101;101\n",
+        encoding="utf-8",
+    )
+
+    metadata = pd.DataFrame({
+        "scan_index": [0],
+        "ms_level": [2],
+        "bruker_precursor_id": pd.array([101], dtype="Int64"),
+    })
+
+    with pytest.raises(ValueError, match="Repeated PASEF precursor ID"):
+        BrukerPsmAssociations(accumulated, metadata)

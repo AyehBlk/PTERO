@@ -21,6 +21,7 @@ from ..spectra import from_mzml
 from ..spectra import _dia
 from ..spectra._bruker import (
     _open_timstof, _read_timstof_frames, _timstof_n_frames, from_timstof_dataframe,
+    _load_bruker_pasef_events, _attach_bruker_acquisition_ids,
 )
 from ..spectra.backends.memory import MsBackendMemory
 from ..spectra.backends.zarr_backend import ZarrStreamWriter
@@ -121,6 +122,10 @@ def _convert_bruker(path, out, ms_level, frames, frame_batch, _log) -> str:
     _log(f"reading {label} in batches of {frame_batch} frames"
          + (f" over frames {start}..{stop}" if stop is not None else " (walking to end of run)"))
 
+    # Preserve original Bruker acquisition identifiers for DDA MS2 spectra.
+    # The authoritative event table is loaded once, then filtered per batch.
+    pasef_events = _load_bruker_pasef_events(path)
+
     writer = ZarrStreamWriter(out, has_4d=True,
                                acquisition_mode=(acq_mode if acq_mode == "dda" else "unknown"))
     f = start
@@ -134,6 +139,10 @@ def _convert_bruker(path, out, ms_level, frames, frame_batch, _log) -> str:
         df = _read_timstof_frames(data, ms_level, (f, e))
         if len(df):
             empty_streak = 0
+            batch_events = pasef_events.loc[
+                pasef_events["bruker_frame_id"].between(f, e - 1)
+            ]
+            df = _attach_bruker_acquisition_ids(df, batch_events)
             mem = from_timstof_dataframe(df, ms_level=None).backend
             writer.append_backend(mem)
             n_spec += len(mem)
@@ -347,7 +356,7 @@ def convert_many(inputs, output_dir, ms_level: Optional[int] = 1,
     ``max_workers`` run at once.
 
     The batch is **fault-tolerant**: if one file fails, it is recorded as an error
-    and the rest continue. Existing stores are skipped unless ``overwrite=True``.
+    and the rest continue. Existing stores are always skipped; the legacy overwrite argument is ignored.
 
     Memory note: each worker holds about one ``frame_batch`` of peaks in RAM, so
     peak memory scales with ``max_workers`` -- raising workers speeds the batch but
@@ -386,7 +395,7 @@ def convert_many(inputs, output_dir, ms_level: Optional[int] = 1,
     def _launch(inp, outp):
         name = Path(inp).name
         stem = Path(str(inp).rstrip("\\/")).stem
-        if Path(outp).exists() and not overwrite:
+        if Path(outp).exists():
             return {"input": inp, "output": outp, "status": "skipped",
                     "reason": "output exists", "seconds": 0.0, "_skip": True}
         cmd = [sys.executable, "-m", "ptero.dashboard.convert", inp, outp,
@@ -394,8 +403,7 @@ def convert_many(inputs, output_dir, ms_level: Optional[int] = 1,
                "--frame-batch", str(int(frame_batch)),
                "--spectrum-batch", str(int(spectrum_batch)),
                "--label", stem]
-        if overwrite:
-            cmd.append("--overwrite")
+        # Existing outputs are never overwritten.
         # stdout is inherited so progress streams live to the console (each line is
         # self-labelled). stderr goes to a temp file so a failure's traceback can be
         # captured without any pipe-buffer deadlock risk.
@@ -481,12 +489,15 @@ def _main(argv=None) -> int:
     ap.add_argument("--spectrum-batch", type=int, default=2000)
     ap.add_argument("--label", default=None, help="tag for progress lines")
     ap.add_argument("--overwrite", action="store_true",
-                    help="replace the output store if it already exists")
+                    help="deprecated; existing output stores are never overwritten")
     args = ap.parse_args(argv)
 
     ms = None if str(args.ms_level).lower() in ("none", "both", "") else int(args.ms_level)
-    if args.overwrite and Path(args.output).exists():
-        shutil.rmtree(args.output, ignore_errors=True)
+    if Path(args.output).exists():
+        raise FileExistsError(
+            f"Conversion refused: output already exists: {args.output}. "
+            "Choose a new destination to preserve the existing dataset."
+        )
     convert_to_zarr(args.input, args.output, ms_level=ms,
                     frame_batch=args.frame_batch, spectrum_batch=args.spectrum_batch,
                     log_prefix=args.label)

@@ -142,7 +142,13 @@ class PteroSpectra:
         for pos, arr in src:
             for _name, op in self._queue:
                 arr = op(arr, col_pos)
-            yield pos, (arr[:, take] if arr.size else np.empty((0, len(cols))))
+            if not arr.size:
+                result = np.empty((0, len(cols)))
+            elif take == list(range(arr.shape[1])):
+                result = arr
+            else:
+                result = arr[:, take]
+            yield pos, result
 
     def mz(self, indices=None) -> list[np.ndarray]:
         return [p[:, 0] for p in self.peaks_data(indices, ("mz",))]
@@ -211,7 +217,8 @@ class PteroSpectra:
             if not arr.size:
                 return arr
             m = arr[:, pos["mz"]]
-            return arr[(m >= mz_min) & (m <= mz_max)]
+            mask = (m >= mz_min) & (m <= mz_max)
+            return arr if mask.all() else arr[mask]
         return self._queue_op(f"filter_mz_range({mz_min},{mz_max})", op)
 
     def filter_mobility(self, im_min: float, im_max: float) -> "PteroSpectra":
@@ -221,7 +228,8 @@ class PteroSpectra:
             if not arr.size:
                 return arr
             im = arr[:, pos["ion_mobility"]]
-            return arr[(im >= im_min) & (im <= im_max)]
+            mask = (im >= im_min) & (im <= im_max)
+            return arr if mask.all() else arr[mask]
         return self._queue_op(f"filter_mobility({im_min},{im_max})", op)
 
     def normalize(self, method: str = "max", target: float = 1.0) -> "PteroSpectra":

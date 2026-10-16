@@ -49,9 +49,9 @@ class MsBackendMemory(MsBackend):
         return cls(
             meta=meta,
             mz=cat(mz_parts),
-            intensity=cat(int_parts).astype(np.float32),
+            intensity=cat(int_parts),
             offsets=np.asarray(offs, np.int64),
-            ion_mobility=(cat(im_parts).astype(np.float32) if has_4d else None),
+            ion_mobility=(cat(im_parts) if has_4d else None),
         )
 
     # ── required interface ───────────────────────────────────────────────

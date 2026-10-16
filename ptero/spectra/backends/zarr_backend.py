@@ -97,6 +97,11 @@ class MsBackendZarr(MsBackend):
         if len(meta) != len(offsets) - 1:
             raise ValueError("metadata must contain one row per spectrum")
 
+        from ._zarr_qc import ZarrQCAccumulator
+
+        qc = ZarrQCAccumulator()
+        qc.add_batch(meta, mz, intensity, offsets, ion_mobility)
+
         root = zarr.open_group(path, mode="w")
         root.attrs.update(store_attrs(
             n_spectra=len(offsets) - 1, has_4d=has_4d,
@@ -119,6 +124,8 @@ class MsBackendZarr(MsBackend):
         off_arr = root.create_array(OFFSETS_ARRAY, shape=(len(offsets),),
                                     chunks=(len(offsets),), dtype="i8")
         off_arr[:] = offsets
+
+        root.attrs["ptero_qc_v1"] = qc.result()
 
         # metadata -> parquet sidecar
         meta = meta.reset_index(drop=True).copy()
@@ -206,19 +213,21 @@ class MsBackendZarr(MsBackend):
             imb = im_a[bstart:bend] if im_a is not None else None
             for k in range(i, j + 1):
                 r = sr[k]; s = int(offs[r]) - bstart; e = int(offs[r + 1]) - bstart
-                arrs = []
-                for c in cols:
+                # Construct the final float64 matrix directly, avoiding
+                # intermediate per-column copies. Preserve requested column
+                # order and the original reader's float64 output.
+                P = np.empty((e - s, len(cols)) if cols else (0, 0), dtype=np.float64)
+                for ci, c in enumerate(cols):
                     if c == "mz":
-                        arrs.append(mzb[s:e].astype(np.float64))
+                        P[:, ci] = mzb[s:e]
                     elif c == "intensity":
-                        arrs.append(intb[s:e].astype(np.float64))
+                        P[:, ci] = intb[s:e]
                     elif c == "ion_mobility":
                         if imb is None:
                             raise KeyError("ion_mobility not available (3D data)")
-                        arrs.append(imb[s:e].astype(np.float64))
+                        P[:, ci] = imb[s:e]
                     else:
                         raise KeyError(f"unknown peaks variable {c!r}")
-                P = np.column_stack(arrs) if arrs else np.empty((0, 0))
                 yield int(order[k]), P
             i = j + 1
 
@@ -242,7 +251,7 @@ class ZarrStreamWriter:
         backend = w.finalize()
     """
 
-    def __init__(self, path, has_4d: bool, chunk_size: int = 1_000_000,
+    def __init__(self, path, has_4d: bool, chunk_size: int = 250_000,
                  acquisition_mode: str = "unknown"):
         _require_zarr()
         import zarr
@@ -250,7 +259,7 @@ class ZarrStreamWriter:
         self.path = str(path)
         self.has_4d = bool(has_4d)
         self.acquisition_mode = str(acquisition_mode)
-        self._root = zarr.open_group(self.path, mode="w")
+        self._root = zarr.open_group(self.path, mode="w-")
         peaks = self._root.create_group(PEAKS_GROUP)
         self._mz = peaks.create_array(PEAK_MZ, shape=(0,), chunks=(chunk_size,), dtype="f8")
         self._int = peaks.create_array(PEAK_INTENSITY, shape=(0,), chunks=(chunk_size,), dtype="f4")
@@ -258,6 +267,8 @@ class ZarrStreamWriter:
                     if self.has_4d else None)
         self._offsets = [0]        # CSR index-pointer (small: one int per spectrum)
         self._meta_parts = []      # list of metadata DataFrames (small)
+        from ._zarr_qc import ZarrQCAccumulator
+        self._qc = ZarrQCAccumulator()
 
     @staticmethod
     def _grow(arr, data):
@@ -277,6 +288,18 @@ class ZarrStreamWriter:
             if self.has_4d:
                 im = mem._im if mem._im is not None else np.full(n_new, np.nan, np.float32)
                 self._grow(self._im, np.asarray(im, np.float32))
+        self._qc.add_batch(
+            mem._meta,
+            np.asarray(mem._mz, np.float64),
+            np.asarray(mem._intensity, np.float32),
+            mem._offsets,
+            (
+                np.asarray(mem._im, np.float32)
+                if mem._im is not None
+                else np.full(n_new, np.nan, np.float32)
+            ) if self.has_4d else None,
+        )
+
         # extend the CSR offsets, shifting this batch's local ends by the running total
         base = self._offsets[-1]
         self._offsets.extend((base + np.asarray(mem._offsets[1:], np.int64)).tolist())
@@ -292,6 +315,8 @@ class ZarrStreamWriter:
             n_spectra=len(offsets) - 1, has_4d=self.has_4d,
             acquisition_mode=self.acquisition_mode,
         ))
+        self._root.attrs["ptero_qc_v1"] = self._qc.result()
+
         meta = (pd.concat(self._meta_parts, ignore_index=True)
                 if self._meta_parts else pd.DataFrame())
         meta["scan_index"] = np.arange(len(meta), dtype=np.int64)   # global, unique across batches
