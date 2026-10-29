@@ -54,3 +54,27 @@ python -m pytest -q
 ```
 
 The first command prints the installed version; the test suite should pass.
+
+## mzZarr v1.0
+
+PTERO provides tools for working with mzZarr, a proposed
+vendor-independent format for mass-spectrometry data. The
+mzZarr v1.0 format specification is maintained separately
+from the PTERO software version.
+
+See the [mzZarr v1.0 specification](docs/mzzarr/SPECIFICATION.md)
+for the normative format requirements.
+
+## License
+
+PTERO software is distributed under the
+[Apache License 2.0](LICENSE).
+
+## Citation
+
+If you use PTERO in research, please cite the software.
+Machine-readable citation metadata is available in
+[CITATION.cff](CITATION.cff).
+
+The PTERO software version is 0.2.0; the mzZarr format
+specification version is 1.0.

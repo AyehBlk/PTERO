@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use PTERO in your research, please cite this software."
+type: software
+title: "PTERO: Proteomics Tool for Exploratory Research & Optimization"
+authors:
+  - family-names: Bouloki
+    given-names: Ayeh
+version: 0.2.0
+repository-code: "https://github.com/AyehBlk/PTERO"
+license: Apache-2.0
