@@ -167,7 +167,7 @@ def _peaks_equal(a, b):
 
 class TestBackends:
     def test_zarr_roundtrip(self, sp4d, tmp_path):
-        z = sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"))
+        z = sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
         assert isinstance(z.backend, MsBackendZarr)
         assert _peaks_equal(sp4d, z)
         np.testing.assert_array_equal(z.rtime, sp4d.rtime)
@@ -178,23 +178,23 @@ class TestBackends:
         assert _peaks_equal(sp4d, p)
 
     def test_zarr_has_4d_flag_persisted(self, sp4d, tmp_path):
-        z = sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"))
+        z = sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
         z2 = MsBackendZarr(str(tmp_path / "e.zarr"))
         assert z2.has_4d
 
     def test_zarr_random_access(self, sp4d, tmp_path):
-        z = sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"))
+        z = sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
         np.testing.assert_array_equal(z[4].mz()[0], sp4d[4].mz()[0])
 
     def test_lazy_queue_materialized_on_convert(self, sp4d, tmp_path):
         filtered = sp4d.filter_intensity(low=1000)
-        z = filtered.set_backend("zarr", path=str(tmp_path / "f.zarr"))
+        z = filtered.set_backend("zarr", path=str(tmp_path / "f.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
         assert len(z.processing_queue) == 0  # queue applied during write
         np.testing.assert_array_equal(z.mz()[0], [300., 500.])
 
     def test_zarr_csr_layout_on_disk(self, sp4d, tmp_path):
         import os
-        sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"))
+        sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
         contents = os.listdir(tmp_path / "e.zarr")
         assert "offsets" in contents and "peaks" in contents
         assert "spectra.parquet" in contents  # metadata in Parquet sidecar
@@ -202,7 +202,7 @@ class TestBackends:
     def test_iter_peaks_matches_peaks_data(self, sp4d, tmp_path):
         # blocked reader must return byte-identical per-spectrum arrays; force many
         # small blocks so the multi-block path is exercised
-        z = sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"))
+        z = sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
         ref = z.peaks_data(columns=("mz", "intensity", "ion_mobility"))
         got = [None] * len(ref)
         for pos, P in z.iter_peaks(columns=("mz", "intensity", "ion_mobility"), block_size=3):
@@ -213,7 +213,7 @@ class TestBackends:
 
     def test_iter_peaks_applies_queue(self, sp4d, tmp_path):
         # queued filters must be applied identically through the blocked path
-        z = sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"))
+        z = sp4d.set_backend("zarr", path=str(tmp_path / "e.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
         q = z.filter_mz_range(250, 1200).filter_mobility(0.5, 1.5)
         ref = q.peaks_data(columns=("mz", "intensity"))
         got = [None] * len(ref)
@@ -357,7 +357,7 @@ class TestToPoints:
 
     def test_backend_independent(self, sp4d, tmp_path):
         a = sp4d.to_points()
-        z = sp4d.set_backend("zarr", path=str(tmp_path / "tp.zarr")).to_points()
+        z = sp4d.set_backend("zarr", path=str(tmp_path / "tp.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2").to_points()
         assert len(a) == len(z)
 
 
@@ -534,7 +534,7 @@ class TestChromatograms:
     def test_backend_independent(self, sp4d, tmp_path):
         ms1 = sp4d.filter_ms_level(1)
         a = ms1.tic()
-        z = ms1.set_backend("zarr", path=str(tmp_path / "chrom.zarr")).tic()
+        z = ms1.set_backend("zarr", path=str(tmp_path / "chrom.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2").tic()
         np.testing.assert_allclose(sorted(a["intensity"]), sorted(z["intensity"]))
 
 
@@ -608,7 +608,7 @@ class TestProcessing:
     def test_bin_backend_independent(self, sp4d, tmp_path):
         ms1 = sp4d.filter_ms_level(1)
         a = [len(m) for m in ms1.bin_mz(1.0).mz()]
-        z = [len(m) for m in ms1.set_backend("zarr", path=str(tmp_path / "bp.zarr")).bin_mz(1.0).mz()]
+        z = [len(m) for m in ms1.set_backend("zarr", path=str(tmp_path / "bp.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2").bin_mz(1.0).mz()]
         assert a == z
 
 
@@ -673,7 +673,7 @@ class TestCombine:
     def test_backend_independent(self, sp4d, tmp_path):
         ms1 = sp4d.filter_ms_level(1)
         a = ms1.combine(n_scans=3)
-        z = ms1.set_backend("zarr", path=str(tmp_path / "cmb.zarr")).combine(n_scans=3)
+        z = ms1.set_backend("zarr", path=str(tmp_path / "cmb.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2").combine(n_scans=3)
         assert len(a) == len(z)
         np.testing.assert_allclose(sorted(a.tic()["intensity"]), sorted(z.tic()["intensity"]))
 
@@ -754,7 +754,7 @@ class TestQC:
 
     def test_backend_independent(self, sp4d, tmp_path):
         a = sp4d.qc()
-        z = sp4d.set_backend("zarr", path=str(tmp_path / "qc.zarr")).qc()
+        z = sp4d.set_backend("zarr", path=str(tmp_path / "qc.zarr"), peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2").qc()
         assert int(a["n_spectra"][0]) == int(z["n_spectra"][0])
         assert np.isclose(a["total_ion_current"][0], z["total_ion_current"][0])
 
@@ -767,7 +767,7 @@ class TestOpenZarr:
         from ptero.spectra import datasets as ds, open_zarr
         zr = str(tmp_path / "run.zarr")
         original = ds.make_4d(n_features=50, n_ms1_scans=30, with_ms2=True, seed=7)
-        original.set_backend("zarr", path=zr)
+        original.set_backend("zarr", path=zr, peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
         run = open_zarr(zr)
         assert len(run) == len(original)
         assert run.has_4d

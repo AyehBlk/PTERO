@@ -124,7 +124,7 @@ def test_annotate_store_stamps_and_is_idempotent(tmp_path):
     peaks = [{"mz": p[:, 0], "intensity": p[:, 1], "ion_mobility": p[:, 2]} for p in peaks]
     combined = from_dataframe(meta, peaks)
     store = str(tmp_path / "bruker_like.zarr")
-    combined.set_backend("zarr", path=store)
+    combined.set_backend("zarr", path=store, peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
 
     # before: centroided column is empty (NaN-filled)
     before = pd.read_parquet(Path(store) / "spectra.parquet")

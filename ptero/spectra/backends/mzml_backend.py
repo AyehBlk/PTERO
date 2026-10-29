@@ -51,6 +51,7 @@ array -> ``has_4d = False``; no isolation window -> no extra columns.
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
 from typing import Optional, Sequence
 
 import numpy as np
@@ -170,6 +171,432 @@ def _isolation_window(spec) -> dict:
 # Names (not accessions) of binary arrays that hold per-peak ion mobility. We
 # match by name so the several ontology variants (mean/raw inverse-reduced-IM,
 # drift-time arrays) are all caught without hard-coding accession numbers.
+
+# MZZARR_MZML_SEMANTIC_EXTRACTION_V1
+_MZML_MOBILITY_QUANTITIES = {
+    "inverse reduced ion mobility": (
+        "inverse_reduced_ion_mobility", "V.s/cm2"
+    ),
+    "ion mobility drift time": (
+        "ion_mobility_drift_time", "millisecond"
+    ),
+}
+
+
+def _mzml_mobility_semantic(name, value):
+    """Identify a mobility quantity only when its source unit is verified.
+
+    Returns (quantity, canonical_unit), or None for unknown or
+    unsupported units. No numerical conversion is performed.
+    """
+    name = str(name).strip().lower()
+    if "inverse reduced ion mobility" in name:
+        pair = _MZML_MOBILITY_QUANTITIES[
+            "inverse reduced ion mobility"
+        ]
+        expected = (
+            "volt-second per square centimeter",
+            "volt second per square centimeter",
+            "v.s/cm2",
+            "v s/cm2",
+        )
+    elif "ion mobility drift time" in name:
+        pair = _MZML_MOBILITY_QUANTITIES[
+            "ion mobility drift time"
+        ]
+        expected = ("millisecond", "milliseconds", "ms")
+    else:
+        return None
+
+    unit = getattr(value, "unit_info", None)
+    if unit is None:
+        return None
+
+    unit = str(unit).strip().lower()
+    if unit not in expected:
+        return None
+
+    return pair
+
+
+def _mzml_scan_mobility_semantic(spec):
+    """Return the scan-level mobility semantic, if unambiguous."""
+    try:
+        scan = spec["scanList"]["scan"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    matches = []
+    for name in _MZML_MOBILITY_QUANTITIES:
+        if name in scan:
+            matches.append(
+                _mzml_mobility_semantic(name, scan[name])
+            )
+
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _mzml_peak_mobility_semantic(spec):
+    """Return the semantic of a unique mobility binary array."""
+    names = [
+        key for key in spec
+        if "mobility" in str(key).lower()
+        and str(key).lower().endswith("array")
+    ]
+    if len(names) != 1:
+        return None
+
+    key = names[0]
+    return _mzml_mobility_semantic(key, spec[key])
+
+
+def _mzml_common_semantic(values):
+    """Return one verified semantic shared by all nonempty entries.
+
+    Unknown entries prevent a global declaration.
+    """
+    values = list(values)
+    if not values or any(value is None for value in values):
+        return None
+    first = values[0]
+    return first if all(value == first for value in values) else None
+
+
+
+
+# MZZARR_MZML_XML_MOBILITY_SEMANTICS_V2
+_MZML_XML_MOBILITY_ACCESSIONS = {
+    "MS:1003006": (
+        "inverse_reduced_ion_mobility",
+        "MS:1002814",
+        "V.s/cm2",
+    ),
+    "MS:1003008": (
+        "inverse_reduced_ion_mobility",
+        "MS:1002814",
+        "V.s/cm2",
+    ),
+}
+
+_MZML_XML_MOBILITY_NAMES = {
+    "mean inverse reduced ion mobility array",
+    "raw inverse reduced ion mobility array",
+    "ion mobility drift time array",
+}
+
+
+def _mzml_xml_local_name(tag):
+    """Strip an XML namespace from an element tag."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _mzml_xml_cv_params(element, groups):
+    """Resolve direct and referenced CV parameters.
+
+    Raises ValueError for unresolved references or reference cycles.
+    """
+    result = []
+
+    def visit(node, active):
+        for child in node:
+            name = _mzml_xml_local_name(child.tag)
+
+            if name == "cvParam":
+                result.append(child.attrib)
+
+            elif name == "referenceableParamGroupRef":
+                ref = child.attrib.get("ref")
+                if not ref or ref not in groups:
+                    raise ValueError(
+                        f"Unresolved referenceableParamGroupRef: {ref}"
+                    )
+                if ref in active:
+                    raise ValueError(
+                        f"Cyclic referenceableParamGroupRef: {ref}"
+                    )
+                visit(groups[ref], active | {ref})
+
+    visit(element, set())
+    return result
+
+
+def _mzml_xml_is_mobility_param(param):
+    accession = param.get("accession", "")
+    name = param.get("name", "").strip().lower()
+    return (
+        accession in _MZML_XML_MOBILITY_ACCESSIONS
+        or name in _MZML_XML_MOBILITY_NAMES
+        or (
+            "mobility" in name
+            and name.endswith("array")
+        )
+    )
+
+
+def _mzml_xml_array_semantic(array_element, groups=None):
+    """Identify one mobility array from verified CV metadata.
+
+    Returns a (quantity, canonical_unit) pair or None.
+    An unrecognized or conflicting mobility declaration is unknown.
+    """
+    groups = {} if groups is None else groups
+    params = _mzml_xml_cv_params(array_element, groups)
+    mobility = [
+        p for p in params
+        if _mzml_xml_is_mobility_param(p)
+    ]
+
+    if len(mobility) != 1:
+        return None
+
+    param = mobility[0]
+    accession = param.get("accession", "")
+    known = _MZML_XML_MOBILITY_ACCESSIONS.get(accession)
+
+    if known is None:
+        return None
+
+    quantity, expected_unit, canonical_unit = known
+
+    # A recognized accession with a contradictory known name
+    # is not trustworthy metadata.
+    name = param.get("name", "").strip().lower()
+    if name in _MZML_XML_MOBILITY_NAMES:
+        if (
+            quantity == "inverse_reduced_ion_mobility"
+            and "drift time" in name
+        ):
+            return None
+        if (
+            quantity == "ion_mobility_drift_time"
+            and "inverse reduced" in name
+        ):
+            return None
+
+    if param.get("unitAccession") != expected_unit:
+        return None
+
+    return quantity, canonical_unit
+
+
+def _mzml_xml_peak_mobility_semantics(path):
+    """Map mzML spectrum IDs to verified peak mobility semantics.
+
+    A missing key means no mobility array was identified.
+    A None value means mobility metadata exists but is ambiguous.
+    """
+    path = str(path)
+    if not path.lower().endswith(".mzml"):
+        raise ValueError("XML mobility extractor requires .mzML")
+
+    result = {}
+    groups = {}
+    context = ET.iterparse(path, events=("start", "end"))
+    spectrum_id = None
+    arrays = []
+    in_spectrum = False
+
+    for event, element in context:
+        name = _mzml_xml_local_name(element.tag)
+
+        if event == "start":
+            if name == "spectrum":
+                spectrum_id = element.attrib.get("id")
+                arrays = []
+                in_spectrum = True
+            continue
+
+        if name == "referenceableParamGroup":
+            ref = element.attrib.get("id")
+            if not ref:
+                raise ValueError(
+                    "referenceableParamGroup without ID"
+                )
+            if ref in groups:
+                raise ValueError(
+                    f"Duplicate referenceableParamGroup: {ref}"
+                )
+            # Keep a detached copy: the streaming parser may
+            # clear the original XML tree later.
+            groups[ref] = ET.fromstring(
+                ET.tostring(element, encoding="utf-8")
+            )
+            element.clear()
+
+        elif name == "binaryDataArray" and in_spectrum:
+            params = _mzml_xml_cv_params(element, groups)
+            if any(
+                _mzml_xml_is_mobility_param(p)
+                for p in params
+            ):
+                arrays.append(
+                    _mzml_xml_array_semantic(
+                        element, groups
+                    )
+                )
+            element.clear()
+
+        elif name == "spectrum" and in_spectrum:
+            if spectrum_id is None:
+                raise ValueError("Spectrum without an ID")
+            if spectrum_id in result:
+                raise ValueError(
+                    f"Duplicate spectrum ID: {spectrum_id}"
+                )
+            if arrays:
+                result[spectrum_id] = (
+                    arrays[0] if len(arrays) == 1 else None
+                )
+            spectrum_id = None
+            arrays = []
+            in_spectrum = False
+            element.clear()
+
+        elif name in (
+            "binaryDataArrayList",
+            "spectrumList",
+            "referenceableParamGroupList",
+            "run",
+        ):
+            element.clear()
+
+    return result
+
+
+
+# MZZARR_MZML_SEMANTIC_ROUTING_V1
+
+def _mzml_array_key_quantity(key):
+    """Classify a Pyteomics mobility array key by known name."""
+    name = str(key).strip().lower()
+
+    if name in (
+        "mean inverse reduced ion mobility array",
+        "raw inverse reduced ion mobility array",
+    ):
+        return "inverse_reduced_ion_mobility"
+
+    if name == "ion mobility drift time array":
+        return "ion_mobility_drift_time"
+
+    return None
+
+
+def _mzml_route_peak_semantics(
+    selected_ids,
+    xml_semantics,
+    array_keys,
+):
+    """Resolve one safe peak mobility declaration.
+
+    Parameters
+    ----------
+    selected_ids:
+        Spectrum IDs in the selected conversion order.
+    xml_semantics:
+        Mapping from spectrum ID to a verified semantic pair,
+        None for ambiguous mobility metadata, or absent for
+        no mobility array.
+    array_keys:
+        Mapping from spectrum ID to the mobility array key
+        actually selected by the Pyteomics backend, or None
+        when no mobility array is selected.
+
+    Returns
+    -------
+    tuple | None:
+        One (quantity, unit) pair, or None if no selected
+        spectrum has a mobility array.
+
+    Raises
+    ------
+    ValueError:
+        On ambiguous metadata, mismatched array identity,
+        or mixed physical quantities.
+    """
+    selected_ids = [str(sid) for sid in selected_ids]
+
+    if len(selected_ids) != len(set(selected_ids)):
+        raise ValueError(
+            "Selected mzML spectrum IDs are not unique"
+        )
+
+    values = []
+
+    for sid in selected_ids:
+        key = array_keys.get(sid)
+        has_xml = sid in xml_semantics
+
+        if key is None and not has_xml:
+            continue
+
+        if key is None and has_xml:
+            raise ValueError(
+                f"mzML spectrum {sid!r}: XML describes a "
+                "mobility array but Pyteomics selected none"
+            )
+
+        if key is not None and not has_xml:
+            raise ValueError(
+                f"mzML spectrum {sid!r}: Pyteomics selected "
+                "a mobility array without verified XML metadata"
+            )
+
+        semantic = xml_semantics[sid]
+        if semantic is None:
+            raise ValueError(
+                f"mzML spectrum {sid!r}: ambiguous or "
+                "unsupported mobility metadata"
+            )
+
+        if (
+            not isinstance(semantic, tuple)
+            or len(semantic) != 2
+        ):
+            raise ValueError(
+                f"mzML spectrum {sid!r}: invalid semantic pair"
+            )
+
+        quantity = _mzml_array_key_quantity(key)
+        if quantity is None:
+            raise ValueError(
+                f"mzML spectrum {sid!r}: unsupported "
+                f"Pyteomics mobility array key {key!r}"
+            )
+
+        if quantity != semantic[0]:
+            raise ValueError(
+                f"mzML spectrum {sid!r}: mobility array "
+                "quantity conflicts with XML declaration"
+            )
+
+        expected_units = {
+            "inverse_reduced_ion_mobility": "V.s/cm2",
+            "ion_mobility_drift_time": "millisecond",
+        }
+        if semantic[1] != expected_units[quantity]:
+            raise ValueError(
+                f"mzML spectrum {sid!r}: unsupported "
+                "mobility unit"
+            )
+
+        values.append(semantic)
+
+    if not values:
+        return None
+
+    first = values[0]
+    if any(value != first for value in values[1:]):
+        raise ValueError(
+            "Selected mzML spectra mix incompatible "
+            "peak mobility quantities or units"
+        )
+
+    return first
+
+
 def _find_mobility_array_key(spec) -> Optional[str]:
     for k in spec.keys():
         kl = str(k).lower()
