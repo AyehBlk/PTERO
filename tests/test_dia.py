@@ -347,7 +347,7 @@ def test_dia_zarr_roundtrip(tmp_path):
 
     mem = MsBackendMemory.from_spectra_list(meta, peaks)
     store = str(tmp_path / "out.zarr")
-    w = _ZarrStreamWriter(store, has_4d=True, acquisition_mode="dia")
+    w = _ZarrStreamWriter(store, has_4d=True, acquisition_mode="dia", peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
     w.append_backend(mem)
     w.finalize()
 

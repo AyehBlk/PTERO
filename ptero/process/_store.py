@@ -192,7 +192,26 @@ def process_store(
 
     _log(f"processing {n_total} spectra ({'4D' if has_4d else '3D'}, mode={acq_mode}) -> {out_path}")
 
-    writer = ZarrStreamWriter(str(out_path), has_4d=has_4d, acquisition_mode=acq_mode)
+    # Preserve declarations from the source; never infer mobility units.
+    import zarr
+    source_attrs = dict(zarr.open_group(str(src_path), mode="r").attrs)
+    mobility_keys = (
+        "peak_ion_mobility_type",
+        "peak_ion_mobility_unit",
+        "spectrum_ion_mobility_type",
+        "spectrum_ion_mobility_unit",
+    )
+    mobility_kwargs = {
+        key: source_attrs[key]
+        for key in mobility_keys
+        if key in source_attrs
+    }
+    writer = ZarrStreamWriter(
+        str(out_path),
+        has_4d=has_4d,
+        acquisition_mode=acq_mode,
+        **mobility_kwargs,
+    )
     buf_peaks: list[dict] = []
     buf_idx: list[int] = []
     expected = 0

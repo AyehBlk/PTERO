@@ -27,7 +27,7 @@ def test_build_app_constructs():
 
 def test_dashboard_loads_and_renders_4d(tmp_path):
     zr = str(tmp_path / "r4.zarr")
-    ds.make_4d(n_features=60, n_ms1_scans=40, with_ms2=True, seed=1).set_backend("zarr", path=zr)
+    ds.make_4d(n_features=60, n_ms1_scans=40, with_ms2=True, seed=1).set_backend("zarr", path=zr, peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
     dash = Dashboard()
     dash._set_data(PteroSpectra(MsBackendZarr(zr)), "test")   # also triggers _render
     assert len(dash.plot_panel) > 0
@@ -52,9 +52,9 @@ def test_stream_writer_matches_oneshot_4d(tmp_path):
     from ptero.spectra import datasets as ds, PteroSpectra, MsBackendZarr
     from ptero.spectra.backends.zarr_backend import _ZarrStreamWriter
     sp = ds.make_4d(n_features=120, n_ms1_scans=60, with_ms2=True, seed=3)
-    a = str(tmp_path / "oneshot.zarr"); sp.set_backend("zarr", path=a)
+    a = str(tmp_path / "oneshot.zarr"); sp.set_backend("zarr", path=a, peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2")
     b = str(tmp_path / "streamed.zarr")
-    w = _ZarrStreamWriter(b, has_4d=True); n = len(sp)
+    w = _ZarrStreamWriter(b, has_4d=True, peak_ion_mobility_type="inverse_reduced_ion_mobility", peak_ion_mobility_unit="V.s/cm2"); n = len(sp)
     for s in range(0, n, 17):                     # odd batch size stresses boundaries
         w.append_backend(sp.backend.subset(range(s, min(s + 17, n))))
     w.finalize()

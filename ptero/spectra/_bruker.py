@@ -60,11 +60,16 @@ _BRUKER_ACQUISITION_FIELDS = (
     "bruker_precursor_id",
     "bruker_scan_begin",
     "bruker_scan_end",
+    "isolation_width",
+    "collision_energy",
+    "precursor_charge",
+    "monoisotopic_mz",
+    "average_mz",
 )
 
 
 def _bruker_group_metadata(group: pd.DataFrame) -> dict:
-    """Preserve optional acquisition IDs only when constant within a group."""
+    """Preserve acquisition IDs and measurements when constant within a group."""
     extra = {}
 
     for column in _BRUKER_ACQUISITION_FIELDS:
@@ -98,12 +103,18 @@ def _load_bruker_pasef_events(path) -> pd.DataFrame:
         events = pd.read_sql_query(
             """
             SELECT
-                Frame AS bruker_frame_id,
-                Precursor AS bruker_precursor_id,
-                ScanNumBegin AS bruker_scan_begin,
-                ScanNumEnd AS bruker_scan_end,
-                IsolationMz AS isolation_mz
-            FROM PasefFrameMsMsInfo
+                p.Frame AS bruker_frame_id,
+                p.Precursor AS bruker_precursor_id,
+                p.ScanNumBegin AS bruker_scan_begin,
+                p.ScanNumEnd AS bruker_scan_end,
+                IsolationMz AS isolation_mz,
+                IsolationWidth AS isolation_width,
+                CollisionEnergy AS collision_energy,
+                q.Charge AS precursor_charge,
+                q.MonoisotopicMz AS monoisotopic_mz,
+                q.AverageMz AS average_mz
+            FROM PasefFrameMsMsInfo AS p
+            LEFT JOIN Precursors AS q ON q.Id = p.Precursor
             """,
             connection,
         )
@@ -154,6 +165,15 @@ def _attach_bruker_acquisition_ids(
             pd.array([pd.NA] * len(output), dtype="Int64"),
             index=output.index,
         )
+
+    for field in (
+        "isolation_width",
+        "collision_energy",
+        "precursor_charge",
+        "monoisotopic_mz",
+        "average_mz",
+    ):
+        output[field] = np.nan
 
     if output.empty:
         return output
@@ -214,14 +234,48 @@ def _attach_bruker_acquisition_ids(
                 matched[field].to_numpy(dtype=np.int64)
             )
 
+        for field in (
+            "isolation_width",
+            "collision_energy",
+            "precursor_charge",
+            "monoisotopic_mz",
+            "average_mz",
+        ):
+            output.loc[group.index, field] = (
+                matched[field].to_numpy(dtype=np.float64)
+            )
+
     return output
 
 
 def _normalize_bruker_id_dtypes(metadata: pd.DataFrame) -> pd.DataFrame:
-    """Keep original Bruker acquisition identifiers as nullable integers."""
-    for column in _BRUKER_ACQUISITION_FIELDS:
+    """Preserve integer acquisition fields and floating-point measurements."""
+    integer_fields = (
+        "bruker_frame_id",
+        "bruker_precursor_id",
+        "bruker_scan_begin",
+        "bruker_scan_end",
+        "precursor_charge",
+    )
+    float_fields = (
+        "isolation_width",
+        "collision_energy",
+        "monoisotopic_mz",
+        "average_mz",
+    )
+
+    for column in integer_fields:
         if column in metadata.columns:
-            metadata[column] = metadata[column].astype("Int64")
+            metadata[column] = pd.to_numeric(
+                metadata[column], errors="raise"
+            ).astype("Int64")
+
+    for column in float_fields:
+        if column in metadata.columns:
+            metadata[column] = pd.to_numeric(
+                metadata[column], errors="raise"
+            ).astype("float64")
+
     return metadata
 
 

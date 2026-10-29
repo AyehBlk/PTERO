@@ -38,7 +38,11 @@ def _make_raw_store(tmp_path: Path, with_im: bool, seed: int = 0) -> str:
         with_ion_mobility=with_im, with_ms2=True, seed=seed,
     )
     raw = tmp_path / ("raw_4d.zarr" if with_im else "raw_3d.zarr")
-    sp.set_backend("zarr", path=str(raw))
+    mobility_kwargs = ({
+        "peak_ion_mobility_type": "inverse_reduced_ion_mobility",
+        "peak_ion_mobility_unit": "V.s/cm2",
+    } if with_im else {})
+    sp.set_backend("zarr", path=str(raw), **mobility_kwargs)
     return str(raw)
 
 

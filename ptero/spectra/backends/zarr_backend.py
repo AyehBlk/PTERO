@@ -75,8 +75,38 @@ class MsBackendZarr(MsBackend):
     @classmethod
     def write(cls, path, meta: pd.DataFrame, mz, intensity, offsets,
               ion_mobility=None, chunk_size: int = 1_000_000,
-              compressor="zstd", acquisition_mode: str = "unknown") -> "MsBackendZarr":
+              compressor="zstd", acquisition_mode: str = "unknown",
+               *, peak_ion_mobility_type=None,
+               peak_ion_mobility_unit=None,
+               spectrum_ion_mobility_type=None,
+               spectrum_ion_mobility_unit=None) -> "MsBackendZarr":
         """Create a Zarr store from CSR peak arrays + metadata, return the backend."""
+        # MZZARR_MOBILITY_WRITER_V1
+        from .._schema import mobility_semantic_attrs
+        _semantic_attrs = mobility_semantic_attrs(
+            has_peak_mobility=ion_mobility is not None,
+            has_spectrum_mobility=(
+                "ion_mobility" in meta.columns
+                and bool(meta["ion_mobility"].notna().any())
+            ),
+            strict=True,
+            peak_ion_mobility_type=peak_ion_mobility_type,
+            peak_ion_mobility_unit=peak_ion_mobility_unit,
+            spectrum_ion_mobility_type=spectrum_ion_mobility_type,
+            spectrum_ion_mobility_unit=spectrum_ion_mobility_unit,
+        )
+        # MZZARR_MS_LEVEL_WRITER_V1
+        import pyarrow as _mzzarr_pa
+        _mzzarr_meta = meta
+        if "ms_level" not in _mzzarr_meta.columns:
+            raise ValueError("mzZarr v1.0 requires ms_level column")
+        if _mzzarr_meta["ms_level"].isna().any():
+            raise ValueError("mzZarr v1.0 ms_level contains null values")
+        _mzzarr_type = _mzzarr_pa.array(_mzzarr_meta["ms_level"]).type
+        if not _mzzarr_pa.types.is_int64(_mzzarr_type):
+            raise ValueError("mzZarr v1.0 ms_level must be int64")
+        if (_mzzarr_meta["ms_level"] <= 0).any():
+            raise ValueError("mzZarr v1.0 ms_level must contain positive integers")
         _require_zarr()
         import zarr
 
@@ -107,6 +137,7 @@ class MsBackendZarr(MsBackend):
             n_spectra=len(offsets) - 1, has_4d=has_4d,
             acquisition_mode=acquisition_mode,
         ))
+        root.attrs.update(_semantic_attrs)
         peaks = root.create_group(PEAKS_GROUP)
 
         def _write_array(group, name, data):
@@ -252,7 +283,26 @@ class ZarrStreamWriter:
     """
 
     def __init__(self, path, has_4d: bool, chunk_size: int = 250_000,
-                 acquisition_mode: str = "unknown"):
+                 acquisition_mode: str = "unknown",
+                 *, peak_ion_mobility_type=None,
+                 peak_ion_mobility_unit=None,
+                 spectrum_ion_mobility_type=None,
+                 spectrum_ion_mobility_unit=None):
+        from .._schema import mobility_semantic_attrs
+        self._semantic_inputs = dict(
+            peak_ion_mobility_type=peak_ion_mobility_type,
+            peak_ion_mobility_unit=peak_ion_mobility_unit,
+            spectrum_ion_mobility_type=spectrum_ion_mobility_type,
+            spectrum_ion_mobility_unit=spectrum_ion_mobility_unit,
+        )
+        # Validate the peak-level declaration before creating a store.
+        mobility_semantic_attrs(
+            has_peak_mobility=bool(has_4d),
+            has_spectrum_mobility=False,
+            strict=True,
+            peak_ion_mobility_type=peak_ion_mobility_type,
+            peak_ion_mobility_unit=peak_ion_mobility_unit,
+        )
         _require_zarr()
         import zarr
 
@@ -281,7 +331,25 @@ class ZarrStreamWriter:
 
     def append_backend(self, mem) -> None:
         """Append one in-memory batch (an ``MsBackendMemory``) to the store."""
+        # MZZARR_MS_LEVEL_STREAM_V1
+        import pyarrow as _mzzarr_pa
+        _mzzarr_meta = mem._meta
+        if "ms_level" not in _mzzarr_meta.columns:
+            raise ValueError("mzZarr v1.0 requires ms_level column")
+        if _mzzarr_meta["ms_level"].isna().any():
+            raise ValueError("mzZarr v1.0 ms_level contains null values")
+        _mzzarr_type = _mzzarr_pa.array(_mzzarr_meta["ms_level"]).type
+        if not _mzzarr_pa.types.is_int64(_mzzarr_type):
+            raise ValueError("mzZarr v1.0 ms_level must be int64")
+        if (_mzzarr_meta["ms_level"] <= 0).any():
+            raise ValueError("mzZarr v1.0 ms_level must contain positive integers")
         n_new = int(mem._offsets[-1])          # total peaks in this batch
+        # MZZARR_STREAM_COMPLETE_MOBILITY_V1
+        if self.has_4d and n_new > 0 and mem._im is None:
+            raise ValueError(
+                'Nonempty 4D batch lacks per-peak ion mobility; '
+                'refusing to fabricate NaN mobility values'
+            )
         if n_new:
             self._grow(self._mz, np.asarray(mem._mz, np.float64))
             self._grow(self._int, np.asarray(mem._intensity, np.float32))
@@ -307,6 +375,18 @@ class ZarrStreamWriter:
 
     def finalize(self) -> "MsBackendZarr":
         """Write offsets, attributes, and the metadata sidecar; return the backend."""
+        from .._schema import mobility_semantic_attrs
+        _has_spectrum_im = any(
+            "ion_mobility" in part.columns
+            and bool(part["ion_mobility"].notna().any())
+            for part in self._meta_parts
+        )
+        _semantic_attrs = mobility_semantic_attrs(
+            has_peak_mobility=self.has_4d,
+            has_spectrum_mobility=_has_spectrum_im,
+            strict=True,
+            **self._semantic_inputs,
+        )
         offsets = np.asarray(self._offsets, np.int64)
         off_arr = self._root.create_array(OFFSETS_ARRAY, shape=(len(offsets),),
                                           chunks=(len(offsets),), dtype="i8")
@@ -315,6 +395,7 @@ class ZarrStreamWriter:
             n_spectra=len(offsets) - 1, has_4d=self.has_4d,
             acquisition_mode=self.acquisition_mode,
         ))
+        self._root.attrs.update(_semantic_attrs)
         self._root.attrs["ptero_qc_v1"] = self._qc.result()
 
         meta = (pd.concat(self._meta_parts, ignore_index=True)

@@ -126,8 +126,14 @@ def _convert_bruker(path, out, ms_level, frames, frame_batch, _log) -> str:
     # The authoritative event table is loaded once, then filtered per batch.
     pasef_events = _load_bruker_pasef_events(path)
 
-    writer = ZarrStreamWriter(out, has_4d=True,
-                               acquisition_mode=(acq_mode if acq_mode == "dda" else "unknown"))
+    writer = ZarrStreamWriter(
+        out, has_4d=True,
+        acquisition_mode=(acq_mode if acq_mode == "dda" else "unknown"),
+        peak_ion_mobility_type="inverse_reduced_ion_mobility",
+        peak_ion_mobility_unit="V.s/cm2",
+        spectrum_ion_mobility_type="inverse_reduced_ion_mobility",
+        spectrum_ion_mobility_unit="V.s/cm2",
+    )
     f = start
     n_spec = n_peaks = 0
     empty_streak = 0
@@ -196,7 +202,13 @@ def _convert_bruker_dia(data, path, out, ms_level, frames, frame_batch, n_frames
     stop = int(frames[1]) if frames is not None else n_frames
     total = (stop - start) if stop is not None else None
 
-    writer = ZarrStreamWriter(out, has_4d=True, acquisition_mode="dia")
+    writer = ZarrStreamWriter(
+        out, has_4d=True, acquisition_mode="dia",
+        peak_ion_mobility_type="inverse_reduced_ion_mobility",
+        peak_ion_mobility_unit="V.s/cm2",
+        spectrum_ion_mobility_type="inverse_reduced_ion_mobility",
+        spectrum_ion_mobility_unit="V.s/cm2",
+    )
     f = start
     n_spec = n_peaks = n_unassigned = 0
     enriched = False                          # add 1/K0 window bounds once
@@ -249,6 +261,25 @@ def _convert_bruker_dia(data, path, out, ms_level, frames, frame_batch, n_frames
     return out
 
 
+
+def _mzzarr_require_complete_peak_mobility(
+    selected_ids, array_keys, peak_counts
+):
+    """Reject missing mobility arrays on nonempty mzML spectra."""
+    missing = [
+        str(sid) for sid in selected_ids
+        if array_keys.get(str(sid)) is None
+        and peak_counts[str(sid)] > 0
+    ]
+    if missing:
+        raise ValueError(
+            "Selected mzML contains nonempty spectra without "
+            "per-peak mobility arrays; refusing to fabricate "
+            "NaN mobility values "
+            f"(first ID: {missing[0]!r}; count: {len(missing)})"
+        )
+
+
 def _convert_mzml(path, out, ms_level, spectrum_batch, _log, transform=None) -> str:
     _log(f"opening {path} …")
     sp = from_mzml(path, ms_level=ms_level, lazy=True)
@@ -262,7 +293,76 @@ def _convert_mzml(path, out, ms_level, spectrum_batch, _log, transform=None) -> 
          + (" (4D)" if has_4d else " (3D)")
          + (" with inline transform" if transform is not None else ""))
 
-    writer = ZarrStreamWriter(out, has_4d=has_4d)
+    # MZZARR_MZML_VERIFIED_PEAK_ROUTING_V2
+    peak_semantic = None
+    if path.lower().endswith(".mzml"):
+        from ptero.spectra.backends.mzml_backend import (
+            _find_mobility_array_key,
+            _mzml_route_peak_semantics,
+            _mzml_xml_peak_mobility_semantics,
+        )
+
+        selected_ids = [
+            str(sid)
+            for sid in meta_all["native_spectrum_id"].tolist()
+        ]
+        xml_all = _mzml_xml_peak_mobility_semantics(path)
+        xml_selected = {
+            sid: xml_all[sid]
+            for sid in selected_ids
+            if sid in xml_all
+        }
+
+        # Read-only inspection using the backend's public
+        # source path and its established indexed reader.
+        from pyteomics import mzml as _mzml
+        with _mzml.MzML(path) as inspection_reader:
+            array_keys = {}
+            peak_counts = {}
+            for sid in selected_ids:
+                inspected = inspection_reader.get_by_id(sid)
+                array_keys[sid] = _find_mobility_array_key(inspected)
+                peak_counts[sid] = len(inspected.get('m/z array', []))
+
+        peak_semantic = _mzml_route_peak_semantics(
+            selected_ids,
+            xml_selected,
+            array_keys,
+        )
+
+        any_selected_mobility = any(
+            key is not None
+            for key in array_keys.values()
+        )
+
+        # No fabricated mobility for nonempty spectra.
+        if any_selected_mobility:
+            _mzzarr_require_complete_peak_mobility(
+                selected_ids, array_keys, peak_counts
+            )
+
+        if any_selected_mobility and not has_4d:
+            raise ValueError(
+                "Selected mzML spectra contain peak mobility "
+                "arrays but the backend classified them as 3D"
+            )
+
+        if has_4d and peak_semantic is None:
+            raise ValueError(
+                "4D mzML data lacks a verified peak "
+                "mobility semantic declaration"
+            )
+
+    writer = ZarrStreamWriter(
+        out,
+        has_4d=has_4d,
+        peak_ion_mobility_type=(
+            peak_semantic[0] if peak_semantic else None
+        ),
+        peak_ion_mobility_unit=(
+            peak_semantic[1] if peak_semantic else None
+        ),
+    )
     for s in range(0, n, spectrum_batch):
         ee = min(s + spectrum_batch, n)
         peaks = sp.peaks_data(indices=list(range(s, ee)), columns=cols)

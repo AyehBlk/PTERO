@@ -326,6 +326,7 @@ class Dashboard:
     @_ptero_profile
     def _set_data(self, sp: PteroSpectra, msg: str):
         self.sp = sp
+
         if self.state is not None:
             active_name = self.sample_sel.value
             self.state.set("raw_store", sp)
@@ -607,6 +608,8 @@ class Dashboard:
                 k += 1
             samples[name] = str(p)
         self._samples = samples
+        self._active_sample_name = None
+        self._activating_sample_name = None
         if self.state is not None:
             self.state.set("raw_datasets", dict(samples))
             self.state.set("raw_sample", None)
@@ -627,19 +630,45 @@ class Dashboard:
         path = self._samples.get(name)
         if not path:
             return
+        self._activating_sample_name = name
         await self._show_loading(f"⏳ Opening sample `{name}` and building the overview…")
         try:
             self.zarr_path.value = path
             sp = open_zarr(path)
             self._set_data(sp, f"Sample `{name}` — {len(sp)} spectra.")
+            self._active_sample_name = name
         except Exception as e:
             self.status.object = f"❌ **Failed to open `{name}`:** {e}"
         finally:
+            if getattr(self, "_activating_sample_name", None) == name:
+                self._activating_sample_name = None
             self.plot_panel.loading = False
 
     async def _on_sample_change(self, event):
         if self._suspend_sample_watch:
             return
+
+        if event.new == getattr(self, "_activating_sample_name", None):
+            print(
+                "[PTERO LOAD GUARD] Skipped in-flight "
+                "activation of current sample",
+                flush=True,
+            )
+            return
+
+        # A scheduled selector callback may run after the first load.
+        # Skip only the sample that is already successfully active.
+        if (
+            self.sp is not None
+            and event.new == getattr(self, "_active_sample_name", None)
+        ):
+            print(
+                "[PTERO LOAD GUARD] Skipped redundant "
+                "activation of current sample",
+                flush=True,
+            )
+            return
+
         await self._activate_sample(event.new)
 
     # ── selection ──────────────────────────────────────────────────────────
@@ -800,7 +829,9 @@ class Dashboard:
         if x is None or len(rt_all) == 0:
             return empty.opts(width=820, height=300, title="Click the chromatogram to show a spectrum")
         i = int(np.argmin(np.abs(rt_all - x)))
+
         P = sp.peaks_data([i], ("mz", "intensity"))[0]
+
         if P.shape[0] == 0:
             return empty.opts(width=820, height=300,
                               title=f"Spectrum — scan {i}, RT {rt_all[i]:.1f} s (empty)")
